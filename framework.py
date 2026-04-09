@@ -36,7 +36,7 @@ scoring function.
 import time
 import json
 import numpy as np
-from scipy.optimize import differential_evolution, minimize
+from scipy.optimize import differential_evolution, minimize, dual_annealing, basinhopping
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple, Optional, Any
 
@@ -478,6 +478,192 @@ class RecipeOptimizer:
             'boundary': {
                 'variables_at_bounds': boundary_vars,
             },
+        }
+
+    def cross_check(
+        self,
+        values: Dict[str, float],
+        sa_restarts: int = 10,
+        sa_maxiter: int = 5000,
+        bh_restarts: int = 10,
+        bh_niter: int = 200,
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Independent cross-check using two fundamentally different global
+        optimization algorithms: simulated annealing and basin-hopping.
+
+        If DE found the true global optimum, both algorithms should converge
+        to the same score. Any improvement proves the DE result was a local
+        optimum.
+
+        Parameters
+        ----------
+        values : dict
+            The candidate recipe (usually the rounded DE result).
+        sa_restarts : int
+            Number of independent dual annealing runs.
+        sa_maxiter : int
+            Max iterations per dual annealing run.
+        bh_restarts : int
+            Number of independent basin-hopping runs.
+        bh_niter : int
+            Number of basin-hopping iterations per run.
+        verbose : bool
+            Print progress.
+
+        Returns
+        -------
+        dict with keys:
+            'base_score': the candidate's score
+            'sa_best_score': best score found by simulated annealing
+            'sa_best_values': corresponding recipe
+            'bh_best_score': best score found by basin-hopping
+            'bh_best_values': corresponding recipe
+            'overall_best_score': best across both methods
+            'overall_best_values': corresponding recipe
+            'confirmed': True if neither method beat the candidate
+            'improvement': score improvement (0 if confirmed)
+        """
+        start = time.time()
+        base_score, _ = self.score_fn(values)
+        bounds = [v.bounds for v in self.variables]
+        x0 = np.array([values[v.name] for v in self.variables])
+
+        if verbose:
+            print(f"\n{'='*65}")
+            print(f"  CROSS-CHECK (base score: {base_score:.6f})")
+            print(f"{'='*65}")
+
+        # -- Simulated Annealing (dual annealing) --
+        if verbose:
+            print(f"\n  Simulated Annealing ({sa_restarts} restarts, {sa_maxiter} maxiter)...")
+
+        sa_best_score = float('inf')
+        sa_best_x = None
+
+        for i in range(sa_restarts):
+            seed = 31 + i * 73
+            result = dual_annealing(
+                self._objective,
+                bounds=bounds,
+                seed=seed,
+                maxiter=sa_maxiter,
+                x0=x0 if i == 0 else None,
+            )
+            sc = -result.fun
+            if verbose:
+                print(f"    SA restart {i+1:2d}/{sa_restarts}: score={sc:.6f}")
+            if result.fun < sa_best_score:
+                sa_best_score = result.fun
+                sa_best_x = result.x.copy()
+
+        sa_score = -sa_best_score
+        sa_values = self._values_from_array(sa_best_x)
+        sa_rounded = self.round_values(sa_values)
+
+        if verbose:
+            print(f"    SA best: {sa_score:.6f}")
+
+        # -- Basin-Hopping --
+        if verbose:
+            print(f"\n  Basin-Hopping ({bh_restarts} restarts, {bh_niter} iterations)...")
+
+        bh_best_score = float('inf')
+        bh_best_x = None
+        rng = np.random.default_rng(seed=99)
+
+        class BoundsEnforcer:
+            def __init__(self, lb, ub):
+                self.lb = np.array(lb)
+                self.ub = np.array(ub)
+            def __call__(self, **kwargs):
+                x = kwargs["x_new"]
+                return bool(np.all(x >= self.lb) and np.all(x <= self.ub))
+
+        lb = [b[0] for b in bounds]
+        ub = [b[1] for b in bounds]
+        enforcer = BoundsEnforcer(lb, ub)
+
+        for i in range(bh_restarts):
+            if i == 0:
+                x_start = x0.copy()
+            else:
+                x_start = np.array([rng.uniform(lo, hi) for lo, hi in bounds])
+
+            # Step size proportional to variable range
+            step_sizes = np.array([(hi - lo) * 0.15 for lo, hi in bounds])
+
+            result = basinhopping(
+                self._objective,
+                x_start,
+                niter=bh_niter,
+                seed=int(rng.integers(0, 2**31)),
+                minimizer_kwargs={
+                    'method': 'Nelder-Mead',
+                    'options': {
+                        'maxiter': 50000,
+                        'maxfev': 100000,
+                        'xatol': 1e-10,
+                        'fatol': 1e-12,
+                        'adaptive': True,
+                    },
+                },
+                stepsize=float(np.mean(step_sizes)),
+                accept_test=enforcer,
+            )
+            sc = -result.fun
+            if verbose:
+                print(f"    BH restart {i+1:2d}/{bh_restarts}: score={sc:.6f}")
+            if result.fun < bh_best_score:
+                bh_best_score = result.fun
+                bh_best_x = result.x.copy()
+
+        bh_score = -bh_best_score
+        bh_values = self._values_from_array(bh_best_x)
+        bh_rounded = self.round_values(bh_values)
+
+        if verbose:
+            print(f"    BH best: {bh_score:.6f}")
+
+        # -- Overall --
+        overall_best_score = max(sa_score, bh_score)
+        if sa_score >= bh_score:
+            overall_best_values = sa_rounded
+        else:
+            overall_best_values = bh_rounded
+
+        confirmed = overall_best_score <= base_score + 1e-6
+        improvement = max(0, overall_best_score - base_score)
+        elapsed = time.time() - start
+
+        if verbose:
+            print(f"\n  {'='*63}")
+            if confirmed:
+                print(f"  CONFIRMED: neither method beat the DE result")
+                print(f"    DE:  {base_score:.6f}")
+                print(f"    SA:  {sa_score:.6f}")
+                print(f"    BH:  {bh_score:.6f}")
+            else:
+                print(f"  IMPROVEMENT FOUND (+{improvement:.6f})")
+                print(f"    DE:  {base_score:.6f}")
+                print(f"    SA:  {sa_score:.6f}")
+                print(f"    BH:  {bh_score:.6f}")
+                print(f"    Best recipe: {overall_best_values}")
+            print(f"  Time: {elapsed:.1f}s")
+            print(f"  {'='*63}")
+
+        return {
+            'base_score': base_score,
+            'sa_best_score': sa_score,
+            'sa_best_values': sa_rounded,
+            'bh_best_score': bh_score,
+            'bh_best_values': bh_rounded,
+            'overall_best_score': overall_best_score,
+            'overall_best_values': overall_best_values,
+            'confirmed': confirmed,
+            'improvement': improvement,
+            'time_s': round(elapsed, 1),
         }
 
     def weight_robustness(

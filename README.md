@@ -128,6 +128,24 @@ Runs three independent checks to confirm the result is the global optimum:
 
 Returns a dict with results from all three checks and an overall `confident` bool.
 
+#### `cross_check(values, sa_restarts=10, sa_maxiter=5000, bh_restarts=10, bh_niter=200) -> dict`
+
+Independent cross-check using two fundamentally different global optimization algorithms:
+
+1. **Simulated Annealing** (`scipy.optimize.dual_annealing`) -- explores the space via probabilistic acceptance of worse solutions, escaping local optima through a cooling schedule. Multiple restarts with different seeds.
+2. **Basin-Hopping** (`scipy.optimize.basinhopping`) -- combines random perturbation with local Nelder-Mead minimization. Each hop jumps to a new region of the search space, and the local optimizer finds the nearest optimum.
+
+If DE found the true global optimum, both algorithms should converge to the same score. Any improvement proves the DE result was a local optimum.
+
+| Kwarg | Default | Description |
+|-------|---------|-------------|
+| `sa_restarts` | 10 | Number of dual annealing runs |
+| `sa_maxiter` | 5000 | Max iterations per SA run |
+| `bh_restarts` | 10 | Number of basin-hopping runs |
+| `bh_niter` | 200 | Hop iterations per BH run |
+
+Returns a dict with `confirmed` bool and best scores from each method.
+
 ## Writing a Good Scoring Function
 
 The scoring function is where all the domain knowledge lives. The optimizer is general; the scoring function is specific. Some tips:

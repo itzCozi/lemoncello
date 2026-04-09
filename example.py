@@ -51,16 +51,20 @@ variables = [
 WEIGHTS = {
     "taste":        0.30,
     "drinkability": 0.30,
-    "ease":         0.20,
-    "strength":     0.10,
+    "strength":     0.15,
+    "ease":         0.10,
     "authenticity": 0.10,
 }
+
+EVAL_COUNT = 0
 
 
 # ---------------------------------------------------------------------------
 # 2. Scoring function
 # ---------------------------------------------------------------------------
 def score(v: dict) -> tuple[float, dict]:
+    global EVAL_COUNT
+    EVAL_COUNT += 1
     lemons = v["lemons"]
     abv    = v["spirit_abv"]
     vol    = v["spirit_vol"]
@@ -327,7 +331,7 @@ if __name__ == "__main__":
     sanity_check()
 
     opt = RecipeOptimizer("Limoncello", variables, score)
-    result = opt.run(de_restarts=15, de_popsize=50, de_maxiter=3000)
+    result = opt.run(de_restarts=75, de_popsize=100, de_maxiter=5000)
 
     print_diagnostics(result["rounded"])
 
@@ -339,11 +343,12 @@ if __name__ == "__main__":
               f"(score {info['score_at_low']:.3f} to {info['score_at_high']:.3f})")
 
     # Save result
+    print(f"\n  Total evaluations: {EVAL_COUNT:,}")
     output = {
         "recipe": result["rounded"],
         "composite_score": round(result["composite"], 6),
         "criterion_scores": {k: round(v, 4) for k, v in result["scores"].items()},
-        "stats": result["stats"],
+        "stats": {**result["stats"], "total_evaluations": EVAL_COUNT},
     }
     with open("result.json", "w") as f:
         json.dump(output, f, indent=2)
@@ -351,3 +356,6 @@ if __name__ == "__main__":
 
     # Verification
     verification = opt.verify(result["rounded"])
+
+    # Cross-check with simulated annealing and basin-hopping
+    cross = opt.cross_check(result["rounded"])
