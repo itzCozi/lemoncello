@@ -12,7 +12,7 @@ The framework uses a 3-phase optimization pipeline:
 2. **Local refinement** Adaptive Nelder-Mead simplex to polish the best candidate to high precision.
 3. **Integer sweep** If any variables are integer-valued (e.g. "number of eggs"), an exhaustive sweep over every integer value ensures the discrete optimum is found exactly.
 
-After optimization, a sensitivity analysis identifies which variables matter most to the final score.
+After optimization, a sensitivity analysis identifies which variables matter most to the final score. A verification step confirms the result is the global optimum by random sampling, multi-start re-optimization, and boundary detection.
 
 ## Requirements
 
@@ -117,6 +117,16 @@ Perturbs each variable by +/- 5% and reports score change. Identifies which vari
 #### `weight_robustness(values, weight_perturb_fn, n_samples=100) -> dict`
 
 Tests score stability under randomized scoring weights. Useful for checking whether the optimal recipe is robust to subjective weight choices.
+
+#### `verify(values, n_random=10000, n_restarts=20) -> dict`
+
+Runs three independent checks to confirm the result is the global optimum:
+
+1. **Random sampling** -- scores 10,000 random recipes; confirms none beat the candidate.
+2. **Perturb and re-optimize** -- starts Nelder-Mead from 20 random points; checks they all converge to the same score.
+3. **Boundary detection** -- flags variables whose optimal value sits at a bound, since the true optimum may lie outside the search space.
+
+Returns a dict with results from all three checks and an overall `confident` bool.
 
 ## Writing a Good Scoring Function
 

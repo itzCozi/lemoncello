@@ -348,3 +348,6 @@ if __name__ == "__main__":
     with open("result.json", "w") as f:
         json.dump(output, f, indent=2)
     print(f"\n  Result saved to result.json")
+
+    # Verification
+    verification = opt.verify(result["rounded"])

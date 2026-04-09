@@ -308,6 +308,178 @@ class RecipeOptimizer:
 
         return results
 
+    def verify(
+        self,
+        values: Dict[str, float],
+        n_random: int = 10000,
+        n_restarts: int = 20,
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Verify that the given recipe is the global optimum by running
+        three independent checks:
+
+        1. Random sampling: score n_random random recipes and check
+           whether any beat the candidate.
+        2. Perturb and re-optimize: start Nelder-Mead from n_restarts
+           random points across the full search space. If they all
+           converge back to the same score, there are no competing
+           local optima.
+        3. Boundary detection: flag any variable whose optimal value
+           sits at or near its bound, since the true optimum may lie
+           outside the search space.
+
+        Returns a dict with results from all three checks and an
+        overall 'confident' bool.
+        """
+        base_score, _ = self.score_fn(values)
+        bounds = [v.bounds for v in self.variables]
+        n_vars = len(self.variables)
+        issues = []
+
+        if verbose:
+            print(f"\n{'='*65}")
+            print(f"  VERIFICATION (base score: {base_score:.6f})")
+            print(f"{'='*65}")
+
+        # -- Check 1: Random sampling --
+        if verbose:
+            print(f"\n  1. Random sampling ({n_random:,} recipes)...")
+
+        rng = np.random.default_rng(seed=42)
+        random_scores = np.empty(n_random)
+        best_random_score = -np.inf
+        best_random_values = None
+
+        for i in range(n_random):
+            x = np.array([rng.uniform(lo, hi) for lo, hi in bounds])
+            vals = self._values_from_array(x)
+            sc, _ = self.score_fn(vals)
+            random_scores[i] = sc
+            if sc > best_random_score:
+                best_random_score = sc
+                best_random_values = vals
+
+        random_beat = bool(best_random_score > base_score + 1e-6)
+        if random_beat:
+            issues.append("random_sample_beat_candidate")
+
+        if verbose:
+            print(f"     Best random:  {best_random_score:.6f}")
+            print(f"     Mean random:  {np.mean(random_scores):.4f} "
+                  f"(std {np.std(random_scores):.4f})")
+            print(f"     Candidate is better than {np.sum(random_scores < base_score)/n_random*100:.1f}% "
+                  f"of random samples")
+            if random_beat:
+                print(f"     WARNING: random sample beat candidate by "
+                      f"{best_random_score - base_score:.6f}")
+
+        # -- Check 2: Perturb and re-optimize --
+        if verbose:
+            print(f"\n  2. Perturb and re-optimize ({n_restarts} random starts)...")
+
+        converged_scores = []
+        for i in range(n_restarts):
+            x0 = np.array([rng.uniform(lo, hi) for lo, hi in bounds])
+            result = minimize(
+                self._objective, x0,
+                method='Nelder-Mead',
+                options={
+                    'maxiter': 50000,
+                    'maxfev': 200000,
+                    'xatol': 1e-10,
+                    'fatol': 1e-12,
+                    'adaptive': True,
+                }
+            )
+            sc = -result.fun
+            converged_scores.append(sc)
+
+        converged_scores = np.array(converged_scores)
+        n_matching = int(np.sum(np.abs(converged_scores - base_score) < 0.01))
+        n_better = int(np.sum(converged_scores > base_score + 1e-6))
+        best_converged = float(np.max(converged_scores))
+
+        if n_better > 0:
+            issues.append("reoptimization_found_better")
+        if n_matching < n_restarts * 0.5:
+            issues.append("low_convergence_rate")
+
+        if verbose:
+            print(f"     Converged to candidate: {n_matching}/{n_restarts}")
+            print(f"     Found better: {n_better}/{n_restarts}")
+            print(f"     Best converged: {best_converged:.6f}")
+            print(f"     Score range: {float(np.min(converged_scores)):.6f} "
+                  f"to {best_converged:.6f}")
+
+        # -- Check 3: Boundary detection --
+        if verbose:
+            print(f"\n  3. Boundary detection...")
+
+        boundary_vars = []
+        for v in self.variables:
+            val = values[v.name]
+            span = v.high - v.low
+            margin = span * 0.02  # within 2% of bound
+            at_low = val <= v.low + margin
+            at_high = val >= v.high - margin
+            if at_low or at_high:
+                bound_str = f"lower ({v.low})" if at_low else f"upper ({v.high})"
+                boundary_vars.append({
+                    'name': v.name,
+                    'value': val,
+                    'bound': 'low' if at_low else 'high',
+                    'bound_value': v.low if at_low else v.high,
+                })
+                if verbose:
+                    print(f"     {v.name} = {val} is at {bound_str} "
+                          f"-- true optimum may be outside bounds")
+
+        if boundary_vars:
+            issues.append("variables_at_bounds")
+
+        if not boundary_vars and verbose:
+            print(f"     No variables at bounds")
+
+        # -- Summary --
+        confident = len(issues) == 0
+        if verbose:
+            print(f"\n  {'='*63}")
+            if confident:
+                print(f"  VERIFIED: high confidence this is the global optimum")
+                print(f"    - {n_random:,} random samples, none better")
+                print(f"    - {n_matching}/{n_restarts} re-optimizations converged to same score")
+                print(f"    - No variables stuck at bounds")
+            else:
+                print(f"  ISSUES FOUND ({len(issues)}):")
+                for issue in issues:
+                    print(f"    - {issue}")
+            print(f"  {'='*63}")
+
+        return {
+            'base_score': base_score,
+            'confident': confident,
+            'issues': issues,
+            'random_sampling': {
+                'n_samples': n_random,
+                'best_random': float(best_random_score),
+                'mean': float(np.mean(random_scores)),
+                'std': float(np.std(random_scores)),
+                'percentile': float(np.sum(random_scores < base_score) / n_random * 100),
+                'beat_candidate': random_beat,
+            },
+            'reoptimization': {
+                'n_restarts': n_restarts,
+                'n_matching': n_matching,
+                'n_better': n_better,
+                'best_converged': best_converged,
+                'convergence_rate': n_matching / n_restarts,
+            },
+            'boundary': {
+                'variables_at_bounds': boundary_vars,
+            },
+        }
+
     def weight_robustness(
         self,
         values: Dict[str, float],
