@@ -34,11 +34,138 @@ scoring function.
 """
 
 import time
+import sys
+import os
 import json
+import itertools
 import numpy as np
 from scipy.optimize import differential_evolution, minimize, dual_annealing, basinhopping
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple, Optional, Any
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
+
+
+def _bar(fraction: float, width: int = 30) -> str:
+    """ASCII progress bar."""
+    filled = round(fraction * width)
+    return f"[{'#' * filled}{'.' * (width - filled)}] {fraction*100:5.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# Worker functions for multiprocessing (must be top-level for pickling)
+# ---------------------------------------------------------------------------
+
+def _de_worker(score_fn, var_names, bounds, seed, maxiter, popsize):
+    """Run a single DE restart in a worker process."""
+    t0 = time.time()
+    def objective(x):
+        vals = {name: float(x[i]) for i, name in enumerate(var_names)}
+        return -score_fn(vals)[0]
+    result = differential_evolution(
+        objective, bounds=bounds, seed=seed,
+        maxiter=maxiter, popsize=popsize,
+        tol=1e-13, atol=1e-13,
+        mutation=(0.5, 1.5), recombination=0.9,
+        polish=False, init='sobol',
+    )
+    return {'score': -result.fun, 'x': result.x.tolist(), 'time': time.time() - t0}
+
+
+def _sweep_combo_worker(score_fn, var_names, best_x_list, all_bounds,
+                        int_indices, int_values, cont_indices, cont_bounds):
+    """Run optimization for one integer combo in a worker process."""
+    t0 = time.time()
+    best_x = np.array(best_x_list)
+    def objective(x_cont):
+        x_full = best_x.copy()
+        for k, idx in enumerate(int_indices):
+            x_full[idx] = int_values[k]
+        for k, ci_idx in enumerate(cont_indices):
+            x_full[ci_idx] = x_cont[k]
+        vals = {name: float(x_full[i]) for i, name in enumerate(var_names)}
+        return -score_fn(vals)[0]
+    r = differential_evolution(
+        objective, bounds=cont_bounds,
+        seed=42, maxiter=300, popsize=10,
+        tol=1e-8, atol=1e-8,
+        mutation=(0.5, 1.5), recombination=0.9,
+        polish=False, init='sobol',
+    )
+    r2 = minimize(
+        objective, r.x, method='Nelder-Mead',
+        options={'maxiter': 10000, 'maxfev': 40000,
+                 'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True},
+    )
+    x_full = best_x.copy()
+    for k, idx in enumerate(int_indices):
+        x_full[idx] = int_values[k]
+    for k, ci_idx in enumerate(cont_indices):
+        x_full[ci_idx] = r2.x[k]
+    vals = {name: float(x_full[i]) for i, name in enumerate(var_names)}
+    sc = score_fn(vals)[0]
+    return {'score': sc, 'int_values': list(int_values), 'x': x_full.tolist(),
+            'time': time.time() - t0}
+
+
+def _sa_worker(score_fn, var_names, bounds, seed, maxiter, x0_list):
+    """Run a single SA restart in a worker process."""
+    t0 = time.time()
+    x0 = np.array(x0_list) if x0_list is not None else None
+    def objective(x):
+        vals = {name: float(x[i]) for i, name in enumerate(var_names)}
+        return -score_fn(vals)[0]
+    result = dual_annealing(
+        objective, bounds=bounds, seed=seed, maxiter=maxiter, x0=x0,
+    )
+    return {'score': -result.fun, 'x': result.x.tolist(), 'time': time.time() - t0}
+
+
+def _bh_worker(score_fn, var_names, bounds, x0_list, niter, seed, step_size):
+    """Run a single BH restart in a worker process."""
+    t0 = time.time()
+    x0 = np.array(x0_list)
+    lb_arr = np.array([b[0] for b in bounds])
+    ub_arr = np.array([b[1] for b in bounds])
+    def objective(x):
+        vals = {name: float(x[i]) for i, name in enumerate(var_names)}
+        return -score_fn(vals)[0]
+    def accept_test(**kwargs):
+        x = kwargs["x_new"]
+        return bool(np.all(x >= lb_arr) and np.all(x <= ub_arr))
+    result = basinhopping(
+        objective, x0, niter=niter, seed=seed,
+        minimizer_kwargs={
+            'method': 'Nelder-Mead',
+            'options': {'maxiter': 50000, 'maxfev': 100000,
+                       'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True},
+        },
+        stepsize=step_size, accept_test=accept_test,
+    )
+    return {'score': -result.fun, 'x': result.x.tolist(), 'time': time.time() - t0}
+
+
+def _nm_worker(score_fn, var_names, x0_list):
+    """Run a single NM restart in a worker process."""
+    def objective(x):
+        vals = {name: float(x[i]) for i, name in enumerate(var_names)}
+        return -score_fn(vals)[0]
+    result = minimize(
+        objective, np.array(x0_list), method='Nelder-Mead',
+        options={'maxiter': 50000, 'maxfev': 200000,
+                 'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True},
+    )
+    return {'score': -result.fun}
 
 
 @dataclass
@@ -106,6 +233,7 @@ class RecipeOptimizer:
         nm_maxiter: int = 100000,
         nm_maxfev: int = 500000,
         verbose: bool = True,
+        n_jobs: int = 1,
     ) -> Dict[str, Any]:
         """
         Run the full 3-phase optimization pipeline.
@@ -116,60 +244,139 @@ class RecipeOptimizer:
 
         Returns a dict with 'values', 'rounded', 'scores', 'composite',
         'leaderboard', and 'stats'.
+
+        Parameters
+        ----------
+        n_jobs : int
+            Number of parallel worker processes. 1 = sequential (default),
+            -1 = use all CPU cores.
         """
         start = time.time()
         bounds = [v.bounds for v in self.variables]
         integer_vars = [(i, v) for i, v in enumerate(self.variables) if v.integer]
 
+        # Convert de_popsize from total population to scipy's multiplier
+        # (scipy uses popsize * n_variables as the actual population size)
+        n_vars = len(self.variables)
+        scipy_popsize = max(5, de_popsize // n_vars)
+        actual_pop = scipy_popsize * n_vars
+
+        _n_jobs = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
+        if _n_jobs > 1:
+            return self._run_parallel(
+                bounds, integer_vars, de_restarts, scipy_popsize, de_maxiter,
+                nm_maxiter, nm_maxfev, verbose, _n_jobs, start,
+                actual_pop,
+            )
+
+        n_int = len(integer_vars)
+        n_cont = len(self.variables) - n_int
+        total_int_combos = 1
+        for _, v in integer_vars:
+            total_int_combos *= int(v.high - v.low + 1)
+
         if verbose:
             print(f"\n{'='*65}")
-            print(f"  RECIPE OPTIMIZER: {self.name}")
-            print(f"  Variables: {len(self.variables)}")
-            criteria_preview = "  (run score_fn to see criteria)"
-            print(f"  DE restarts: {de_restarts}, popsize: {de_popsize}")
+            print(f"   RECIPE OPTIMIZER: {self.name}")
+            print(f"{'='*65}")
+            print(f"  Variables:    {len(self.variables)} ({n_cont} continuous, {n_int} integer)")
+            print(f"  DE config:    {de_restarts} restarts x pop {actual_pop} x {de_maxiter} maxiter")
+            if integer_vars:
+                int_names = ', '.join(v.name for _, v in integer_vars)
+                print(f"  Int sweep:    {total_int_combos} combos ({int_names})")
+            est_evals = de_restarts * actual_pop * de_maxiter
+            print(f"  Est. evals:   ~{est_evals:,.0f} (Phase 1 only)")
             print(f"{'='*65}")
 
         # -- Phase 1: DE global search --
         if verbose:
-            print(f"\n--- Phase 1: Differential Evolution ({de_restarts} restarts) ---")
+            print(f"\n  Phase 1: Differential Evolution")
+            print(f"  {'-'*61}")
 
         best_score = float('inf')
         best_x = None
+        p1_start = time.time()
+        improvements = 0
+        restart_times = []
 
         for i in range(de_restarts):
+            restart_start = time.time()
             seed = 7 + i * 101
             self._eval_count = 0
+
+            # Callback to show live progress within each DE restart
+            _de_gen = [0]
+            def _de_callback(xk, convergence=0):
+                _de_gen[0] += 1
+                g = _de_gen[0]
+                if verbose and (g % 50 == 0 or g == 1):
+                    elapsed_r = time.time() - restart_start
+                    if g > 0:
+                        eta_r = elapsed_r / g * (de_maxiter - g)
+                    else:
+                        eta_r = 0
+                    sc_now = -self._objective(xk)
+                    bar = _bar(g / de_maxiter, 20)
+                    print(f"\r  restart {i+1}/{de_restarts}  gen {g:4d}/{de_maxiter}  "
+                          f"{bar}  score={sc_now:.4f}  ({_fmt_time(elapsed_r)}, "
+                          f"ETA {_fmt_time(eta_r)})   ", end="", flush=True)
+
             result = differential_evolution(
                 self._objective,
                 bounds=bounds,
                 seed=seed,
                 maxiter=de_maxiter,
-                popsize=de_popsize,
+                popsize=scipy_popsize,
                 tol=1e-13,
                 atol=1e-13,
                 mutation=(0.5, 1.5),
                 recombination=0.9,
                 polish=False,
                 init='sobol',
+                callback=_de_callback,
             )
+            restart_elapsed = time.time() - restart_start
+            restart_times.append(restart_elapsed)
             sc = -result.fun
-            if verbose:
-                vals = self._values_from_array(result.x)
-                brief = "  ".join(f"{k}={v:.1f}" for k, v in list(vals.items())[:4])
-                print(f"  Restart {i+1:2d}/{de_restarts}: score={sc:.6f}  {brief}")
-            if result.fun < best_score:
+            improved = result.fun < best_score
+            if improved:
+                improvements += 1
                 best_score = result.fun
                 best_x = result.x.copy()
 
-        p1_time = time.time() - start
+            if verbose:
+                if sc > -best_score + 1e-8:
+                    marker = ' +'
+                elif abs(sc - (-best_score)) < 1e-8:
+                    marker = ' *'
+                else:
+                    marker = ' -'
+                elapsed = time.time() - start
+                avg_per = elapsed / (i + 1)
+                eta = avg_per * (de_restarts - i - 1)
+                progress = _bar((i + 1) / de_restarts, 30)
+                line = (f"\r  {i+1:3d}/{de_restarts}  {progress}  "
+                        f"score={sc:.6f}  best={-best_score:.6f}  "
+                        f"({_fmt_time(restart_elapsed)}, ETA {_fmt_time(eta)}){marker}")
+                print(f"{line:<100}")
+                sys.stdout.flush()
+
+        p1_time = time.time() - p1_start
         if verbose:
-            print(f"  Phase 1 best: {-best_score:.6f} ({p1_time:.1f}s)")
+            avg_t = sum(restart_times) / len(restart_times)
+            print(f"  {'-'*61}")
+            print(f"  Phase 1 done: best={-best_score:.6f}  "
+                  f"({improvements} improvements in {de_restarts} restarts, "
+                  f"{_fmt_time(p1_time)}, avg {_fmt_time(avg_t)}/restart)")
 
         # -- Phase 2: Nelder-Mead refinement --
         if verbose:
-            print(f"\n--- Phase 2: Nelder-Mead Local Refinement ---")
+            print(f"\n  Phase 2: Nelder-Mead Local Refinement")
+            print(f"  {'-'*61}")
 
+        p2_start = time.time()
         self._eval_count = 0
+        pre_nm = -best_score
         local = minimize(
             self._objective, best_x,
             method='Nelder-Mead',
@@ -181,63 +388,115 @@ class RecipeOptimizer:
                 'adaptive': True,
             }
         )
-        if verbose:
-            print(f"  Nelder-Mead: {self._eval_count:,} evals, score={-local.fun:.6f}")
-        if local.fun < best_score:
+        p2_time = time.time() - p2_start
+        nm_improved = local.fun < best_score
+        if nm_improved:
             best_score = local.fun
             best_x = local.x.copy()
+        if verbose:
+            delta = -local.fun - pre_nm
+            if nm_improved:
+                status = f"+ improved by {delta:.6f}"
+            else:
+                status = "* no improvement"
+            print(f"  {self._eval_count:,} evals, {_fmt_time(p2_time)}  "
+                  f"score={-local.fun:.6f} ({status})")
 
         # -- Phase 3: Integer variable sweep --
         leaderboard = []
         if integer_vars:
             if verbose:
-                print(f"\n--- Phase 3: Integer Variable Sweep ---")
+                print(f"\n  Phase 3: Integer Variable Sweep")
+                print(f"  {'-'*61}")
 
+            p3_start = time.time()
             # Handle each integer variable
             for idx, var in integer_vars:
                 cont_indices = [i for i in range(len(self.variables))
                                 if not self.variables[i].integer]
                 cont_bounds = [bounds[i] for i in cont_indices]
+                n_vals = int(var.high - var.low + 1)
+                sweep_best = -float('inf')
+                sweep_best_val = None
 
-                for int_val in range(int(var.low), int(var.high) + 1):
+                if verbose:
+                    print(f"  Sweeping {var.name} ({int(var.low)}-{int(var.high)}, {n_vals} values):")
+
+                for j, int_val in enumerate(range(int(var.low), int(var.high) + 1)):
+                    val_start = time.time()
                     def obj_int(x_cont, iv=int_val, ci=cont_indices, ii=idx):
                         x_full = best_x.copy()
                         x_full[ii] = iv
-                        for j, ci_idx in enumerate(ci):
-                            x_full[ci_idx] = x_cont[j]
+                        for k, ci_idx in enumerate(ci):
+                            x_full[ci_idx] = x_cont[k]
                         return self._objective(x_full)
+
+                    _p3_gen = [0]
+                    def _p3_callback(xk, convergence=0, _j=j, _iv=int_val, _nv=n_vals, _vn=var.name):
+                        _p3_gen[0] += 1
+                        g = _p3_gen[0]
+                        if verbose and (g % 50 == 0 or g == 1):
+                            el = time.time() - val_start
+                            bar = _bar(g / 300, 12)
+                            print(f"\r    {_vn}={_iv:2d} ({_j+1}/{_nv})  gen {g:4d}/300  "
+                                  f"{bar}  ({_fmt_time(el)})   ", end="", flush=True)
 
                     r = differential_evolution(
                         obj_int, bounds=cont_bounds,
-                        seed=42, maxiter=2000, popsize=40,
-                        tol=1e-13, atol=1e-13,
+                        seed=42, maxiter=300, popsize=10,
+                        tol=1e-8, atol=1e-8,
                         mutation=(0.5, 1.5), recombination=0.9,
                         polish=False, init='sobol',
+                        callback=_p3_callback,
                     )
                     r2 = minimize(
                         obj_int, r.x,
                         method='Nelder-Mead',
                         options={
-                            'maxiter': 50000, 'maxfev': 200000,
-                            'xatol': 1e-12, 'fatol': 1e-14,
+                            'maxiter': 10000, 'maxfev': 40000,
+                            'xatol': 1e-10, 'fatol': 1e-12,
                             'adaptive': True,
                         }
                     )
 
                     x_full = best_x.copy()
                     x_full[idx] = int_val
-                    for j, ci_idx in enumerate(cont_indices):
-                        x_full[ci_idx] = r2.x[j]
+                    for k, ci_idx in enumerate(cont_indices):
+                        x_full[ci_idx] = r2.x[k]
 
                     sc = -self._objective(x_full)
                     leaderboard.append((sc, int_val, x_full.copy()))
+                    val_time = time.time() - val_start
+                    is_best = sc > sweep_best
+                    if is_best:
+                        sweep_best = sc
+                        sweep_best_val = int_val
+
                     if verbose:
-                        print(f"  {var.name}={int_val:2d}: score={sc:.6f}")
+                        if is_best:
+                            marker = ' +'
+                        elif abs(sc - sweep_best) < 1e-8:
+                            marker = ' *'
+                        else:
+                            marker = ' -'
+                        progress = _bar((j + 1) / n_vals, 15)
+                        line = (f"\r    {var.name}={int_val:2d}  {progress}  "
+                                f"score={sc:.6f}  ({_fmt_time(val_time)}){marker}")
+                        print(f"{line:<80}")
+                        sys.stdout.flush()
 
                 leaderboard.sort(reverse=True, key=lambda c: c[0])
                 if leaderboard:
                     best_score = -leaderboard[0][0] if leaderboard[0][0] > -best_score else best_score
                     best_x = leaderboard[0][2].copy()
+
+                if verbose:
+                    print(f"  Best {var.name}={sweep_best_val} (score={sweep_best:.6f})")
+
+            p3_time = time.time() - p3_start
+            if verbose:
+                print(f"  {'-'*61}")
+                print(f"  Phase 3 done: {_fmt_time(p3_time)}")
 
         total_time = time.time() - start
 
@@ -260,14 +519,18 @@ class RecipeOptimizer:
 
         if verbose:
             print(f"\n{'='*65}")
-            print(f"  RESULT: score={composite:.6f}")
+            print(f"   OPTIMAL RECIPE (score={composite:.6f})")
+            print(f"{'='*65}")
+            print(f"  Recipe:")
             for k, v in rounded_values.items():
                 unit = next((va.unit for va in self.variables if va.name == k), "")
-                print(f"    {k}: {v} {unit}")
-            print(f"  Criteria:")
+                print(f"    {k:20s} = {v:<10} {unit}")
+            print(f"\n  Scores:")
+            max_k = max(len(k) for k in criterion_scores)
             for k, v in criterion_scores.items():
-                print(f"    {k}: {v:.3f}")
-            print(f"  Time: {total_time:.1f}s")
+                bar = '#' * int(v) + '.' * (10 - int(v))
+                print(f"    {k:{max_k}s}  {bar}  {v:.3f}/10")
+            print(f"\n  Total time: {_fmt_time(total_time)}")
             print(f"{'='*65}")
 
         return result
@@ -314,6 +577,7 @@ class RecipeOptimizer:
         n_random: int = 10000,
         n_restarts: int = 20,
         verbose: bool = True,
+        n_jobs: int = 1,
     ) -> Dict[str, Any]:
         """
         Verify that the given recipe is the global optimum by running
@@ -344,7 +608,7 @@ class RecipeOptimizer:
 
         # -- Check 1: Random sampling --
         if verbose:
-            print(f"\n  1. Random sampling ({n_random:,} recipes)...")
+            print(f"\n  1. Random sampling ({n_random:,} recipes)...", flush=True)
 
         rng = np.random.default_rng(seed=42)
         random_scores = np.empty(n_random)
@@ -376,24 +640,38 @@ class RecipeOptimizer:
 
         # -- Check 2: Perturb and re-optimize --
         if verbose:
-            print(f"\n  2. Perturb and re-optimize ({n_restarts} random starts)...")
+            print(f"\n  2. Perturb and re-optimize ({n_restarts} random starts)...", flush=True)
 
-        converged_scores = []
-        for i in range(n_restarts):
-            x0 = np.array([rng.uniform(lo, hi) for lo, hi in bounds])
-            result = minimize(
-                self._objective, x0,
-                method='Nelder-Mead',
-                options={
-                    'maxiter': 50000,
-                    'maxfev': 200000,
-                    'xatol': 1e-10,
-                    'fatol': 1e-12,
-                    'adaptive': True,
-                }
-            )
-            sc = -result.fun
-            converged_scores.append(sc)
+        _n_jobs = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
+        if _n_jobs > 1:
+            var_names = [v.name for v in self.variables]
+            x0_lists = [
+                np.array([rng.uniform(lo, hi) for lo, hi in bounds]).tolist()
+                for _ in range(n_restarts)
+            ]
+            with ProcessPoolExecutor(max_workers=_n_jobs) as pool:
+                futures = [
+                    pool.submit(_nm_worker, self.score_fn, var_names, x0)
+                    for x0 in x0_lists
+                ]
+                converged_scores = [fut.result()['score'] for fut in futures]
+        else:
+            converged_scores = []
+            for i in range(n_restarts):
+                x0 = np.array([rng.uniform(lo, hi) for lo, hi in bounds])
+                result = minimize(
+                    self._objective, x0,
+                    method='Nelder-Mead',
+                    options={
+                        'maxiter': 50000,
+                        'maxfev': 200000,
+                        'xatol': 1e-10,
+                        'fatol': 1e-12,
+                        'adaptive': True,
+                    }
+                )
+                sc = -result.fun
+                converged_scores.append(sc)
 
         converged_scores = np.array(converged_scores)
         n_matching = int(np.sum(np.abs(converged_scores - base_score) < 0.01))
@@ -488,6 +766,7 @@ class RecipeOptimizer:
         bh_restarts: int = 10,
         bh_niter: int = 200,
         verbose: bool = True,
+        n_jobs: int = 1,
     ) -> Dict[str, Any]:
         """
         Independent cross-check using two fundamentally different global
@@ -530,6 +809,14 @@ class RecipeOptimizer:
         bounds = [v.bounds for v in self.variables]
         x0 = np.array([values[v.name] for v in self.variables])
 
+        _n_jobs = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
+        if _n_jobs > 1:
+            return self._cross_check_parallel(
+                values, bounds, x0, base_score,
+                sa_restarts, sa_maxiter, bh_restarts, bh_niter,
+                verbose, _n_jobs,
+            )
+
         if verbose:
             print(f"\n{'='*65}")
             print(f"  CROSS-CHECK (base score: {base_score:.6f})")
@@ -544,19 +831,40 @@ class RecipeOptimizer:
 
         for i in range(sa_restarts):
             seed = 31 + i * 73
+            _sa_iter = [0]
+            _sa_start = time.time()
+            def _sa_callback(x, f, context):
+                _sa_iter[0] += 1
+                n = _sa_iter[0]
+                if verbose and (n % 100 == 0 or n == 1):
+                    el = time.time() - _sa_start
+                    sc_now = -f
+                    bar = _bar(n / sa_maxiter, 15)
+                    print(f"\r    SA {i+1}/{sa_restarts}  iter {n:4d}/{sa_maxiter}  "
+                          f"{bar}  score={sc_now:.4f}  ({_fmt_time(el)})   ", end="", flush=True)
             result = dual_annealing(
                 self._objective,
                 bounds=bounds,
                 seed=seed,
                 maxiter=sa_maxiter,
                 x0=x0 if i == 0 else None,
+                callback=_sa_callback,
             )
             sc = -result.fun
-            if verbose:
-                print(f"    SA restart {i+1:2d}/{sa_restarts}: score={sc:.6f}")
-            if result.fun < sa_best_score:
+            improved = result.fun < sa_best_score
+            if improved:
                 sa_best_score = result.fun
                 sa_best_x = result.x.copy()
+            if verbose:
+                if sc > -sa_best_score + 1e-8:
+                    marker = ' +'
+                elif abs(sc - (-sa_best_score)) < 1e-8:
+                    marker = ' *'
+                else:
+                    marker = ' -'
+                line = f"\r    SA {i+1:2d}/{sa_restarts}: score={sc:.6f}  best={-sa_best_score:.6f}{marker}"
+                print(f"{line:<80}")
+                sys.stdout.flush()
 
         sa_score = -sa_best_score
         sa_values = self._values_from_array(sa_best_x)
@@ -594,6 +902,17 @@ class RecipeOptimizer:
             # Step size proportional to variable range
             step_sizes = np.array([(hi - lo) * 0.15 for lo, hi in bounds])
 
+            _bh_iter = [0]
+            _bh_start = time.time()
+            def _bh_callback(x, f, accepted):
+                _bh_iter[0] += 1
+                n = _bh_iter[0]
+                if verbose and (n % 10 == 0 or n == 1):
+                    el = time.time() - _bh_start
+                    sc_now = -f
+                    bar = _bar(n / bh_niter, 15)
+                    print(f"\r    BH {i+1}/{bh_restarts}  hop {n:3d}/{bh_niter}  "
+                          f"{bar}  score={sc_now:.4f}  ({_fmt_time(el)})   ", end="", flush=True)
             result = basinhopping(
                 self._objective,
                 x_start,
@@ -611,13 +930,23 @@ class RecipeOptimizer:
                 },
                 stepsize=float(np.mean(step_sizes)),
                 accept_test=enforcer,
+                callback=_bh_callback,
             )
             sc = -result.fun
-            if verbose:
-                print(f"    BH restart {i+1:2d}/{bh_restarts}: score={sc:.6f}")
-            if result.fun < bh_best_score:
+            improved = result.fun < bh_best_score
+            if improved:
                 bh_best_score = result.fun
                 bh_best_x = result.x.copy()
+            if verbose:
+                if sc > -bh_best_score + 1e-8:
+                    marker = ' +'
+                elif abs(sc - (-bh_best_score)) < 1e-8:
+                    marker = ' *'
+                else:
+                    marker = ' -'
+                line = f"\r    BH {i+1:2d}/{bh_restarts}: score={sc:.6f}  best={-bh_best_score:.6f}{marker}"
+                print(f"{line:<80}")
+                sys.stdout.flush()
 
         bh_score = -bh_best_score
         bh_values = self._values_from_array(bh_best_x)
@@ -651,6 +980,495 @@ class RecipeOptimizer:
                 print(f"    BH:  {bh_score:.6f}")
                 print(f"    Best recipe: {overall_best_values}")
             print(f"  Time: {elapsed:.1f}s")
+            print(f"  {'='*63}")
+
+        return {
+            'base_score': base_score,
+            'sa_best_score': sa_score,
+            'sa_best_values': sa_rounded,
+            'bh_best_score': bh_score,
+            'bh_best_values': bh_rounded,
+            'overall_best_score': overall_best_score,
+            'overall_best_values': overall_best_values,
+            'confirmed': confirmed,
+            'improvement': improvement,
+            'time_s': round(elapsed, 1),
+        }
+
+    # ------------------------------------------------------------------
+    # Parallel implementations
+    # ------------------------------------------------------------------
+
+    def _run_parallel(self, bounds, integer_vars, de_restarts, de_popsize,
+                      de_maxiter, nm_maxiter, nm_maxfev, verbose, n_jobs, start,
+                      actual_pop=None):
+        """Parallel implementation of run()."""
+        n_int = len(integer_vars)
+        n_cont = len(self.variables) - n_int
+        total_int_combos = 1
+        for _, v in integer_vars:
+            total_int_combos *= int(v.high - v.low + 1)
+        if actual_pop is None:
+            actual_pop = de_popsize * len(self.variables)
+
+        if verbose:
+            print(f"\n{'='*65}")
+            print(f"   RECIPE OPTIMIZER: {self.name}")
+            print(f"{'='*65}")
+            print(f"  Variables:    {len(self.variables)} ({n_cont} continuous, {n_int} integer)")
+            print(f"  DE config:    {de_restarts} restarts x pop {actual_pop} x {de_maxiter} maxiter")
+            print(f"  Parallel:     {n_jobs} workers")
+            if integer_vars:
+                int_names = ', '.join(v.name for _, v in integer_vars)
+                print(f"  Int sweep:    {total_int_combos} combos ({int_names})")
+            est_evals = de_restarts * actual_pop * de_maxiter
+            print(f"  Est. evals:   ~{est_evals:,.0f} (Phase 1 only)")
+            print(f"{'='*65}")
+
+        var_names = [v.name for v in self.variables]
+
+        # -- Calibration: run a mini-DE to measure actual restart speed --
+        est_restart_s = None
+        if verbose:
+            try:
+                _cal_count = [0]
+                _cal_times = []
+                _cal_t0 = [time.time()]
+                def _cal_callback(xk, convergence=0):
+                    _cal_count[0] += 1
+                    now = time.time()
+                    _cal_times.append(now - _cal_t0[0])
+                    _cal_t0[0] = now
+                def _cal_obj(x):
+                    vals = {name: float(x[i]) for i, name in enumerate(var_names)}
+                    return -self.score_fn(vals)[0]
+                differential_evolution(
+                    _cal_obj, bounds=bounds, seed=999,
+                    maxiter=20, popsize=de_popsize,
+                    tol=0, atol=0,
+                    mutation=(0.5, 1.5), recombination=0.9,
+                    polish=False, init='sobol',
+                    callback=_cal_callback,
+                )
+                # Use last 15 gens (skip first 5 for init overhead)
+                steady = _cal_times[5:] if len(_cal_times) > 10 else _cal_times
+                avg_gen_s = sum(steady) / len(steady) if steady else 0.1
+                # Calibration ran single-threaded; parallel workers compete for
+                # CPU cache/memory bandwidth, so scale up by ~1.5x
+                parallel_overhead = 1.5 if n_jobs > 1 else 1.0
+                est_restart_s = avg_gen_s * de_maxiter * parallel_overhead
+                total_batches = (de_restarts + n_jobs - 1) // n_jobs
+                est_phase1 = est_restart_s * total_batches
+                print(f"  Calibration:  {avg_gen_s*1000:.0f}ms/gen  "
+                      f"(~{_fmt_time(est_restart_s)} per restart)")
+                print(f"  Est. Phase 1: ~{_fmt_time(est_phase1)}  "
+                      f"(first results in ~{_fmt_time(est_restart_s)})")
+                print(f"{'='*65}")
+            except Exception:
+                print(f"{'='*65}")
+
+        # -- Phase 1: Parallel DE --
+        if verbose:
+            print(f"\n  Phase 1: Differential Evolution ({n_jobs} workers)")
+            print(f"  {'-'*61}")
+
+        best_score = -float('inf')
+        best_x = None
+        p1_start = time.time()
+        improvements = 0
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            futures = {}
+            for i in range(de_restarts):
+                seed = 7 + i * 101
+                fut = pool.submit(
+                    _de_worker, self.score_fn, var_names, bounds,
+                    seed, de_maxiter, de_popsize,
+                )
+                futures[fut] = i
+
+            completed = 0
+            pending = set(futures.keys())
+            while pending:
+                import concurrent.futures as _cf
+                done, pending = _cf.wait(pending, timeout=2.0,
+                                         return_when=_cf.FIRST_COMPLETED)
+                if not done and verbose:
+                    elapsed = time.time() - p1_start
+                    progress = _bar(completed / de_restarts, 30)
+                    active = min(n_jobs, de_restarts - completed)
+                    eta_str = ""
+                    if est_restart_s and completed == 0:
+                        eta_str = f"  ~{_fmt_time(est_restart_s)} per restart"
+                    elif completed > 0:
+                        per_restart = elapsed / completed
+                        remaining = (de_restarts - completed) / n_jobs * per_restart
+                        eta_str = f"  ETA {_fmt_time(remaining)}"
+                    print(f"\r  {completed:3d}/{de_restarts}  {progress}  "
+                          f"running {active} workers...  "
+                          f"({_fmt_time(elapsed)}){eta_str}          ",
+                          end="", flush=True)
+                    continue
+                for fut in done:
+                    completed += 1
+                    res = fut.result()
+                    sc = res['score']
+                    x = np.array(res['x'])
+
+                    if sc > best_score + 1e-8:
+                        marker = ' +'
+                        improvements += 1
+                        best_score = sc
+                        best_x = x.copy()
+                    elif abs(sc - best_score) < 1e-8:
+                        marker = ' *'
+                    else:
+                        marker = ' -'
+
+                    if verbose:
+                        elapsed = time.time() - start
+                        eta = elapsed / completed * (de_restarts - completed)
+                        progress = _bar(completed / de_restarts, 30)
+                        line = (f"\r  {completed:3d}/{de_restarts}  {progress}  "
+                                f"score={sc:.6f}  best={best_score:.6f}  "
+                                f"({_fmt_time(res['time'])}, ETA {_fmt_time(eta)}){marker}")
+                        print(f"{line:<100}")
+                        sys.stdout.flush()
+
+        p1_time = time.time() - p1_start
+        if verbose:
+            print(f"  {'-'*61}")
+            print(f"  Phase 1 done: best={best_score:.6f}  "
+                  f"({improvements} improvements in {de_restarts} restarts, "
+                  f"{_fmt_time(p1_time)})")
+
+        # -- Phase 2: Nelder-Mead (sequential) --
+        if verbose:
+            print(f"\n  Phase 2: Nelder-Mead Local Refinement")
+            print(f"  {'-'*61}")
+
+        p2_start = time.time()
+        self._eval_count = 0
+        pre_nm = best_score
+        local = minimize(
+            self._objective, best_x,
+            method='Nelder-Mead',
+            options={
+                'maxiter': nm_maxiter,
+                'maxfev': nm_maxfev,
+                'xatol': 1e-12,
+                'fatol': 1e-14,
+                'adaptive': True,
+            }
+        )
+        p2_time = time.time() - p2_start
+        nm_score = -local.fun
+        nm_improved = nm_score > best_score + 1e-10
+        if nm_improved:
+            best_score = nm_score
+            best_x = local.x.copy()
+        if verbose:
+            delta = nm_score - pre_nm
+            status = f"+ improved by {delta:.6f}" if nm_improved else "* no improvement"
+            print(f"  {self._eval_count:,} evals, {_fmt_time(p2_time)}  "
+                  f"score={nm_score:.6f} ({status})")
+
+        # -- Phase 3: Parallel Integer Sweep --
+        leaderboard = []
+        if integer_vars:
+            if verbose:
+                print(f"\n  Phase 3: Integer Sweep ({total_int_combos} combos, {n_jobs} workers)")
+                print(f"  {'-'*61}")
+
+            p3_start = time.time()
+            int_indices = [idx for idx, _ in integer_vars]
+            cont_indices = [i for i in range(len(self.variables))
+                            if not self.variables[i].integer]
+            cont_bounds = [bounds[i] for i in cont_indices]
+
+            int_ranges = [range(int(v.low), int(v.high) + 1) for _, v in integer_vars]
+            combos = list(itertools.product(*int_ranges))
+
+            with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+                futures = {}
+                for combo in combos:
+                    fut = pool.submit(
+                        _sweep_combo_worker, self.score_fn, var_names,
+                        best_x.tolist(), bounds, int_indices, list(combo),
+                        cont_indices, cont_bounds,
+                    )
+                    futures[fut] = combo
+
+                sweep_best = -float('inf')
+                completed = 0
+                pending = set(futures.keys())
+                while pending:
+                    import concurrent.futures as _cf
+                    done, pending = _cf.wait(pending, timeout=2.0,
+                                             return_when=_cf.FIRST_COMPLETED)
+                    if not done and verbose:
+                        elapsed = time.time() - p3_start
+                        progress = _bar(completed / len(combos), 15)
+                        active = min(n_jobs, len(combos) - completed)
+                        print(f"\r    {completed:3d}/{len(combos)} {progress} "
+                              f"{active} workers ({_fmt_time(elapsed)})   ",
+                              end="", flush=True)
+                        continue
+                    for fut in done:
+                        completed += 1
+                        res = fut.result()
+                        sc = res['score']
+                        combo = futures[fut]
+                        x_full = np.array(res['x'])
+                        leaderboard.append((sc, combo, x_full.copy()))
+
+                        if sc > sweep_best + 1e-8:
+                            marker = ' +'
+                            sweep_best = sc
+                        elif abs(sc - sweep_best) < 1e-8:
+                            marker = ' *'
+                        else:
+                            marker = ' -'
+
+                        if verbose:
+                            combo_str = ', '.join(
+                                f"{integer_vars[k][1].name}={combo[k]}"
+                                for k in range(len(integer_vars))
+                            )
+                            progress = _bar(completed / len(combos), 15)
+                            line = (f"\r    {completed:3d}/{len(combos)}  {progress}  "
+                                    f"{combo_str}  score={sc:.6f}  "
+                                    f"({_fmt_time(res['time'])}){marker}")
+                            print(f"{line:<100}")
+                            sys.stdout.flush()
+
+            leaderboard.sort(reverse=True, key=lambda x: x[0])
+            if leaderboard and leaderboard[0][0] > best_score:
+                best_score = leaderboard[0][0]
+                best_x = leaderboard[0][2].copy()
+
+            p3_time = time.time() - p3_start
+            if verbose:
+                best_combo = leaderboard[0][1]
+                combo_str = ', '.join(
+                    f"{integer_vars[k][1].name}={best_combo[k]}"
+                    for k in range(len(integer_vars))
+                )
+                print(f"  {'-'*61}")
+                print(f"  Phase 3 done: best={leaderboard[0][0]:.6f} "
+                      f"({combo_str}), {_fmt_time(p3_time)}")
+
+        total_time = time.time() - start
+
+        # Build result
+        raw_values = self._values_from_array(best_x)
+        rounded_values = self.round_values(raw_values)
+        composite, criterion_scores = self.score_fn(rounded_values)
+
+        result = {
+            'values': raw_values,
+            'rounded': rounded_values,
+            'composite': composite,
+            'scores': criterion_scores,
+            'leaderboard': [
+                (sc, {integer_vars[k][1].name: combo[k]
+                      for k in range(len(integer_vars))})
+                for sc, combo, _ in leaderboard[:10]
+            ],
+            'stats': {
+                'total_time_s': round(total_time, 1),
+                'de_restarts': de_restarts,
+                'n_jobs': n_jobs,
+            },
+        }
+
+        if verbose:
+            print(f"\n{'='*65}")
+            print(f"   OPTIMAL RECIPE (score={composite:.6f})")
+            print(f"{'='*65}")
+            print(f"  Recipe:")
+            for k, v in rounded_values.items():
+                unit = next((va.unit for va in self.variables if va.name == k), "")
+                print(f"    {k:20s} = {v:<10} {unit}")
+            print(f"\n  Scores:")
+            max_k = max(len(k) for k in criterion_scores)
+            for k, v in criterion_scores.items():
+                bar = '#' * int(v) + '.' * (10 - int(v))
+                print(f"    {k:{max_k}s}  {bar}  {v:.3f}/10")
+            print(f"\n  Total time: {_fmt_time(total_time)}")
+            print(f"{'='*65}")
+
+        return result
+
+    def _cross_check_parallel(self, values, bounds, x0, base_score,
+                               sa_restarts, sa_maxiter, bh_restarts, bh_niter,
+                               verbose, n_jobs):
+        """Parallel implementation of cross_check()."""
+        start = time.time()
+        var_names = [v.name for v in self.variables]
+
+        if verbose:
+            print(f"\n{'='*65}")
+            print(f"  CROSS-CHECK (base score: {base_score:.6f}, {n_jobs} workers)")
+            print(f"{'='*65}")
+
+        # -- Parallel SA --
+        if verbose:
+            print(f"\n  Simulated Annealing ({sa_restarts} restarts, {n_jobs} workers)...")
+
+        sa_best_score = -float('inf')
+        sa_best_x = None
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            futures = {}
+            for i in range(sa_restarts):
+                seed = 31 + i * 73
+                x0_list = x0.tolist() if i == 0 else None
+                fut = pool.submit(
+                    _sa_worker, self.score_fn, var_names, bounds,
+                    seed, sa_maxiter, x0_list,
+                )
+                futures[fut] = i
+
+            completed = 0
+            pending = set(futures.keys())
+            while pending:
+                import concurrent.futures as _cf
+                done, pending = _cf.wait(pending, timeout=2.0,
+                                         return_when=_cf.FIRST_COMPLETED)
+                if not done and verbose:
+                    elapsed = time.time() - start
+                    progress = _bar(completed / sa_restarts, 15)
+                    active = min(n_jobs, sa_restarts - completed)
+                    print(f"\r    {completed:2d}/{sa_restarts}  {progress}  "
+                          f"running {active} workers...  "
+                          f"({_fmt_time(elapsed)})          ",
+                          end="", flush=True)
+                    continue
+                for fut in done:
+                    completed += 1
+                    res = fut.result()
+                    sc = res['score']
+                    x = np.array(res['x'])
+
+                    if sc > sa_best_score + 1e-8:
+                        marker = ' +'
+                        sa_best_score = sc
+                        sa_best_x = x.copy()
+                    elif abs(sc - sa_best_score) < 1e-8:
+                        marker = ' *'
+                    else:
+                        marker = ' -'
+
+                    if verbose:
+                        progress = _bar(completed / sa_restarts, 15)
+                        line = (f"\r    {completed:2d}/{sa_restarts}  {progress}  "
+                                f"score={sc:.6f}  best={sa_best_score:.6f}  "
+                                f"({_fmt_time(res['time'])}){marker}")
+                        print(f"{line:<80}")
+                        sys.stdout.flush()
+
+        sa_score = sa_best_score
+        sa_values = self._values_from_array(sa_best_x)
+        sa_rounded = self.round_values(sa_values)
+        if verbose:
+            print(f"    SA best: {sa_score:.6f}")
+
+        # -- Parallel BH --
+        if verbose:
+            print(f"\n  Basin-Hopping ({bh_restarts} restarts, {n_jobs} workers)...")
+
+        bh_best_score = -float('inf')
+        bh_best_x = None
+        rng = np.random.default_rng(seed=99)
+        step_sizes = np.array([(hi - lo) * 0.15 for lo, hi in bounds])
+        step_size = float(np.mean(step_sizes))
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            futures = {}
+            for i in range(bh_restarts):
+                if i == 0:
+                    x_start = x0.tolist()
+                else:
+                    x_start = [float(rng.uniform(lo, hi)) for lo, hi in bounds]
+                seed = int(rng.integers(0, 2**31))
+                fut = pool.submit(
+                    _bh_worker, self.score_fn, var_names, bounds,
+                    x_start, bh_niter, seed, step_size,
+                )
+                futures[fut] = i
+
+            completed = 0
+            bh_start = time.time()
+            pending = set(futures.keys())
+            while pending:
+                import concurrent.futures as _cf
+                done, pending = _cf.wait(pending, timeout=2.0,
+                                         return_when=_cf.FIRST_COMPLETED)
+                if not done and verbose:
+                    elapsed = time.time() - bh_start
+                    progress = _bar(completed / bh_restarts, 15)
+                    active = min(n_jobs, bh_restarts - completed)
+                    print(f"\r    {completed:2d}/{bh_restarts}  {progress}  "
+                          f"running {active} workers...  "
+                          f"({_fmt_time(elapsed)})          ",
+                          end="", flush=True)
+                    continue
+                for fut in done:
+                    completed += 1
+                    res = fut.result()
+                    sc = res['score']
+                    x = np.array(res['x'])
+
+                    if sc > bh_best_score + 1e-8:
+                        marker = ' +'
+                        bh_best_score = sc
+                        bh_best_x = x.copy()
+                    elif abs(sc - bh_best_score) < 1e-8:
+                        marker = ' *'
+                    else:
+                        marker = ' -'
+
+                    if verbose:
+                        progress = _bar(completed / bh_restarts, 15)
+                        line = (f"\r    {completed:2d}/{bh_restarts}  {progress}  "
+                                f"score={sc:.6f}  best={bh_best_score:.6f}  "
+                                f"({_fmt_time(res['time'])}){marker}")
+                        print(f"{line:<80}")
+                        sys.stdout.flush()
+                    sys.stdout.flush()
+
+        bh_score = bh_best_score
+        bh_values = self._values_from_array(bh_best_x)
+        bh_rounded = self.round_values(bh_values)
+        if verbose:
+            print(f"    BH best: {bh_score:.6f}")
+
+        # -- Overall --
+        overall_best_score = max(sa_score, bh_score)
+        if sa_score >= bh_score:
+            overall_best_values = sa_rounded
+        else:
+            overall_best_values = bh_rounded
+
+        confirmed = overall_best_score <= base_score + 1e-6
+        improvement = max(0, overall_best_score - base_score)
+        elapsed = time.time() - start
+
+        if verbose:
+            print(f"\n  {'='*63}")
+            if confirmed:
+                print(f"  CONFIRMED: neither method beat the DE result")
+                print(f"    DE:  {base_score:.6f}")
+                print(f"    SA:  {sa_score:.6f}")
+                print(f"    BH:  {bh_score:.6f}")
+            else:
+                print(f"  IMPROVEMENT FOUND (+{improvement:.6f})")
+                print(f"    DE:  {base_score:.6f}")
+                print(f"    SA:  {sa_score:.6f}")
+                print(f"    BH:  {bh_score:.6f}")
+                print(f"    Best recipe: {overall_best_values}")
+            print(f"  Time: {_fmt_time(elapsed)}")
             print(f"  {'='*63}")
 
         return {
