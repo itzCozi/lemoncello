@@ -9,3 +9,4 @@ build/
 *.json
 !package.json
 output.txt
+recipe.txt

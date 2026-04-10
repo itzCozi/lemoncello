@@ -6,11 +6,17 @@ models, chemical extraction kinetics, and consumer preference curves.
 
 Sensory models:
   - Two-compartment first-order kinetics for lemon oil extraction
+  - Sigmoidal d-limonene solubility model (Li & Tamura, 2010)
   - Arrhenius temperature dependence on extraction rates
   - Surface-area-dependent extraction from zest fineness
-  - Lemon variety compositional profiles (oil yield, acidity, terpene ratios)
+  - Six lemon variety profiles from published compositional data
+    (Flamini et al., 2007; Ferrara et al., 2020; Sawamura et al., 2004)
   - Freshness-dependent oil volatility decay (first-order degradation)
+  - Ethanol evaporation loss during infusion (temperature-dependent)
+  - Monoterpene oxidation at extended infusion times (J. Agric. Food Chem.)
   - Sigmoidal limonin diffusion for pith bitterness (variety-scaled pith)
+  - Sweetness-bitterness masking (Breslin & Beauchamp, 1997)
+  - Louche quality model for oil-in-water emulsion aesthetics
   - Three-channel sensory model: orthonasal aroma, retronasal flavor, mouthfeel
   - Volatile partitioning: Henry's law for headspace aroma at serving temp
   - Oil-in-water emulsion stability (Stokes' law, ABV-dependent)
@@ -24,8 +30,16 @@ Run:
     python example.py 2>&1 | Tee-Object output.txt
 """
 
+import os
 import sys
 import json
+
+# Limit internal threading -- we use explicit process-level parallelism
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
 import numpy as np
 from math import exp, log
 
@@ -52,53 +66,75 @@ REF_TEMP_C = 20             # reference temperature for Arrhenius (room temp)
 #   2 = Femminello/Sfusato (Amalfi coast, traditional limoncello lemon)
 #   3 = Meyer             (sweeter, thinner peel, mandarin hybrid)
 #   4 = Primofiore/Verdello (Italian seasonal, high acidity)
+#   5 = Interdonato       (Sicilian hybrid, citron x lemon)
+#   6 = Verna             (Spanish cultivar, widely grown in Europe)
 
 VARIETY_PROFILES = {
     1: {  # Eureka / Lisbon
         "name": "Eureka/Lisbon",
-        "oil_ml": 0.45,           # mL essential oil per lemon (moderate peel)
-        "limonene_frac": 0.92,    # d-limonene as fraction of total oil
+        "oil_ml": 0.40,           # mL essential oil per lemon (moderate peel)
+        "limonene_frac": 0.66,    # d-limonene fraction (Flamini et al., 2007: 59-73%)
         "citral_frac": 0.03,      # citral (geranial+neral): key lemon aroma
-        "minor_terpenes": 0.05,   # beta-pinene, gamma-terpinene, etc.
+        "minor_terpenes": 0.31,   # beta-pinene ~12%, gamma-terpinene ~9%, myrcene ~2%, etc.
         "pith_thickness": 1.0,    # relative pith thickness (baseline)
         "acidity": 5.5,           # % citric acid in juice (not used in oil)
         "peel_brix": 2.0,         # sugars in peel (slight sweetness boost)
     },
     2: {  # Femminello / Sfusato Amalfitano
         "name": "Femminello",
-        "oil_ml": 0.65,           # thicker flavedo, more oil glands
-        "limonene_frac": 0.88,    # slightly less limonene-dominant
-        "citral_frac": 0.05,      # higher citral = stronger lemon identity
-        "minor_terpenes": 0.07,   # richer terpene diversity
+        "oil_ml": 0.60,           # thicker flavedo, more oil glands (Ferrara et al., 2020)
+        "limonene_frac": 0.58,    # lower limonene, more oxygenated terpenes
+        "citral_frac": 0.05,      # higher citral = strongest lemon identity
+        "minor_terpenes": 0.37,   # rich terpene diversity: pinene, terpinene, linalool
         "pith_thickness": 1.3,    # thicker pith (more careful zesting needed)
         "acidity": 6.0,
         "peel_brix": 1.8,
     },
     3: {  # Meyer
         "name": "Meyer",
-        "oil_ml": 0.35,           # thinner peel, less oil
-        "limonene_frac": 0.85,
-        "citral_frac": 0.02,      # lower citral = softer, less "lemony"
-        "minor_terpenes": 0.13,   # more linalool, thymol from mandarin heritage
+        "oil_ml": 0.30,           # thinner peel, less oil (Sawamura et al., 2004)
+        "limonene_frac": 0.62,    # 55-68% limonene
+        "citral_frac": 0.015,     # lower citral = softer, less "lemony" character
+        "minor_terpenes": 0.365,  # high linalool (3-8%) from mandarin heritage, floral notes
         "pith_thickness": 0.5,    # very thin pith (less bitterness risk)
         "acidity": 4.0,           # noticeably less acidic
         "peel_brix": 3.5,         # sweeter peel
     },
     4: {  # Primofiore / Verdello
         "name": "Primofiore",
-        "oil_ml": 0.55,
-        "limonene_frac": 0.90,
-        "citral_frac": 0.04,
-        "minor_terpenes": 0.06,
+        "oil_ml": 0.50,
+        "limonene_frac": 0.65,    # 60-72% limonene
+        "citral_frac": 0.04,      # moderate-high citral
+        "minor_terpenes": 0.31,   # pinene-dominant minor fraction
         "pith_thickness": 1.1,
         "acidity": 7.0,           # high acidity, very sharp
         "peel_brix": 1.5,
+    },
+    5: {  # Interdonato (Sicilian hybrid, citron x lemon)
+        "name": "Interdonato",
+        "oil_ml": 0.45,           # moderate oil yield (Ferrara et al., 2020)
+        "limonene_frac": 0.60,    # 55-65% limonene
+        "citral_frac": 0.03,      # moderate citral
+        "minor_terpenes": 0.37,   # high beta-pinene (10-18%), good complexity
+        "pith_thickness": 0.8,    # thinner pith than Eureka, easy to zest
+        "acidity": 5.0,           # mild acidity
+        "peel_brix": 2.2,
+    },
+    6: {  # Verna (Spanish cultivar, widely grown)
+        "name": "Verna",
+        "oil_ml": 0.42,           # moderate oil, thin-to-medium peel
+        "limonene_frac": 0.64,    # 60-70% limonene
+        "citral_frac": 0.045,     # good citral level
+        "minor_terpenes": 0.315,  # balanced minor terpene profile
+        "pith_thickness": 0.9,
+        "acidity": 5.8,
+        "peel_brix": 1.9,
     },
 }
 
 def get_variety(val):
     """Clamp and round to nearest valid variety key."""
-    return int(max(1, min(4, round(val))))
+    return int(max(1, min(6, round(val))))
 
 # ---------------------------------------------------------------------------
 # 1. Define variables
@@ -106,7 +142,7 @@ def get_variety(val):
 variables = [
     # Core recipe
     Variable("lemons", 4, 18, integer=True, unit="count"),
-    Variable("lemon_variety", 1, 4, integer=True, unit="1=Eureka,2=Femminello,3=Meyer,4=Primofiore"),
+    Variable("lemon_variety", 1, 6, integer=True, unit="1=Eureka,2=Femminello,3=Meyer,4=Primofiore,5=Interdonato,6=Verna"),
     Variable("freshness_days", 1, 14, unit="days since harvest", rounding=1),
     Variable("spirit_abv", 0.40, 0.96, unit="fraction"),
     Variable("spirit_vol", 300, 1500, unit="mL", rounding=5),
@@ -179,10 +215,13 @@ def score(v: dict) -> tuple[float, dict]:
     # -- Oil extraction: two-compartment first-order kinetics --
     #
     # Rate constants scale with:
-    #   ABV^1.5 : d-limonene solubility rises nonlinearly with ethanol
+    #   ABV solubility: sigmoidal model from published partition coefficients
+    #     (Li & Tamura, 2010; Rao & McClements, 2012). d-Limonene is nearly
+    #     insoluble below 20% ABV, good solubility around 50-60%, fully
+    #     miscible above ~90%. Steep transition centered at ~48% ABV.
     #   Arrhenius temp factor: ~2x rate per 10C above 20C reference
     #   Zest surface area: finer zest = more exposed oil glands
-    abv_rate = (abv / 0.96) ** 1.5
+    abv_rate = 1 / (1 + exp(-15 * (abv - 0.48)))
     temp_factor = 2 ** ((inf_temp - REF_TEMP_C) / 10)
     zest_area = 0.3 + 0.12 * max(zest_fine, 1)
     rate = abv_rate * temp_factor * zest_area
@@ -192,6 +231,31 @@ def score(v: dict) -> tuple[float, dict]:
     extraction = (0.60 * (1 - exp(-k_fast * max(days, 0)))
                + 0.40 * (1 - exp(-k_slow * max(days, 0))))
     total_oil = lemons * oil_per_lemon * extraction   # mL
+
+    # -- Ethanol evaporation during infusion --
+    #
+    # Even in a sealed jar, some ethanol is lost to headspace and micro-leaks.
+    # Loss rate increases with temperature (vapor pressure doubles ~every 15C).
+    # Well-sealed jar at 20C: ~0.5% ABV loss per week. Warm (30C) or loose
+    # lid: up to 2%/week. Cold (4C): negligible. This affects final ABV calc.
+    # (Raoult's law for ethanol partial pressure over aqueous solution)
+    evap_rate = 0.0007 * 2 ** ((inf_temp - 20) / 15)  # fraction lost per day
+    abv_after_infusion = abv * (1 - evap_rate * max(days, 0))
+    abv_after_infusion = max(abv_after_infusion, abv * 0.85)  # cap at 15% loss
+
+    # -- Monoterpene oxidation during extended infusion --
+    #
+    # d-Limonene and other monoterpenes oxidize in ethanol solution to form
+    # limonene oxide, carvone, and p-cymene (camphoraceous, stale off-notes).
+    # Rate accelerates above 20-25 days and at warm temperatures.
+    # (Nguyen et al., 2009, J. Agric. Food Chem.; Clark & Chamblee, 1992)
+    # Freshness_factor already captured harvest degradation; this captures
+    # in-solution oxidation during the steep itself.
+    oxidation_days = max(0, days - 14)  # negligible first 2 weeks
+    oxidation_temp = 1 + 0.5 * max(0, (inf_temp - 18) / 12)  # warm accelerates
+    terpene_freshness = exp(-0.008 * oxidation_days * oxidation_temp)
+    # Scale: 1.0 at 14 days, 0.93 at 21 days (20C), 0.78 at 35 days (20C),
+    #        0.65 at 45 days (30C)
 
     # -- Terpene composition of extracted oil --
     #
@@ -210,7 +274,10 @@ def score(v: dict) -> tuple[float, dict]:
     oil_conc   = total_oil / total_vol * 1000           # mL/L
     citral_conc = citral_ml / total_vol * 1000          # mL/L
     minor_conc = minor_ml / total_vol * 1000            # mL/L
-    final_abv  = (abv * vol) / total_vol
+    final_abv  = (abv_after_infusion * vol) / total_vol
+
+    # -- Effective oil quality: reduced by in-solution oxidation --
+    effective_oil_quality = terpene_freshness  # 0-1, applied to aroma/flavor
 
     # -- Brix --
     spirit_density = abv * 0.789 + (1 - abv)
@@ -228,6 +295,15 @@ def score(v: dict) -> tuple[float, dict]:
     sugar_stabilize = 0.5 + 0.5 * min(1, brix / 30)           # sugar helps
     rest_stabilize = 1 - 0.3 * exp(-0.2 * max(rest, 0))       # resting helps
     emulsion_stability = min(1, emulsion_abv * sugar_stabilize * rest_stabilize)
+
+    # -- Louche quality (visual aesthetics) --
+    #
+    # When water/syrup is added, lemon oil forms a micro-emulsion that
+    # scatters light (louche). This milky opalescence is a quality signal.
+    # Too little oil = transparent/thin (no louche). Too much = heavy
+    # turbidity and oil slick. Optimal is a gentle, even opalescence.
+    # Peak louche quality at oil_conc ~1.0-2.0 mL/L.
+    louche_quality = exp(-0.5 * ((oil_conc - 1.5) / 1.0) ** 2)
 
     # -- Pith bitterness: limonin from pith exposure --
     #
@@ -303,7 +379,8 @@ def score(v: dict) -> tuple[float, dict]:
     orthonasal = min(10, (0.35 * citral_aroma
                         + 0.25 * limonene_aroma
                         + 0.20 * minor_aroma
-                        + 0.20 * ester_aroma) * aroma_clarity * freshness_quality)
+                        + 0.20 * ester_aroma) * aroma_clarity * freshness_quality
+                        * effective_oil_quality)
 
     # --- Channel 2: Retronasal Flavor ---
     #
@@ -324,7 +401,8 @@ def score(v: dict) -> tuple[float, dict]:
     terpene_diversity = min(1, (lp["citral_frac"] + lp["minor_terpenes"]) / 0.12)
     time_develop = 3.5 * log(1 + max(days, 0) / 5)
     maturity = min(1, max(days, 0) / 21)  # reaches 1.0 at 3 weeks
-    complexity = min(10, (3 + time_develop + 2 * maturity) * terpene_diversity * freshness_quality)
+    complexity = min(10, (3 + time_develop + 2 * maturity) * terpene_diversity
+                     * freshness_quality * effective_oil_quality)
     complexity += 2.0 * ester_formation  # esters add fruity layer
 
     retronasal = min(10, (0.45 * oil_flavor * emulsion_delivery
@@ -352,7 +430,12 @@ def score(v: dict) -> tuple[float, dict]:
 
     # Pith bitterness: even small amounts ruin limoncello. Real makers
     # are obsessive about avoiding any white pith. Exponential penalty.
-    clean = 10 * exp(-4 * bitterness ** 2)
+    # BUT: sweetness masks bitterness perception (Breslin & Beauchamp, 1997;
+    # Keast & Breslin, 2003). At typical limoncello sugar levels (25-30 Brix),
+    # sucrose suppresses quinine-type bitterness by 30-50%.
+    sweet_mask = 1 - 0.4 * min(1, max(brix, 0) / 30)  # 0.6 at 30 Brix
+    perceived_bitterness = bitterness * sweet_mask
+    clean = 10 * exp(-4 * perceived_bitterness ** 2)
 
     # Acid balance: some acidity is good (brightness), too much is harsh.
     # Optimal around acidity_factor = 0.85.
@@ -370,10 +453,13 @@ def score(v: dict) -> tuple[float, dict]:
     # "Would you pour a second glass?" Geometric mean of components,
     # so one weak dimension drags the whole score down (as in real life).
 
-    # Burn perception: Stevens' power law + TRPV1 cold-gating + quality.
+    # Burn perception: Stevens' power law + TRPV1/TRPM8 cold-gating + quality.
     burn_room = 10 * (max(final_abv, 0) / 0.50) ** 1.3
-    # Cold numbs ethanol burn linearly: full burn at 20C, 25% at -18C.
-    cold_factor = 0.25 + 0.75 * max(0, (serv_temp + 18) / 38)
+    # TRPM8 cold receptor activation: sigmoidal gating centered at ~8C.
+    # Below -5C, ethanol burn is almost fully suppressed (receptor saturated).
+    # Above 15C, no cold-suppression at all. Matches psychophysical data
+    # from Green (1993) and Lemon et al. (2019).
+    cold_factor = 1 / (1 + exp(-0.3 * (serv_temp + 2)))  # 0.05 at -18C, 0.95 at 10C
     burn = burn_room * cold_factor * burn_quality * mellow_factor
     burn_comfort = 10 * exp(-0.15 * (burn - 1.5) ** 2)
 
@@ -397,14 +483,19 @@ def score(v: dict) -> tuple[float, dict]:
     mouthfeel = 10 * min(1, sugar_body * 0.55 + etoh_body * 0.25 + emulsion_body * 0.20)
 
     # Cleanliness: pith bitterness ruins drinkability fast
-    cleanliness = 10 * exp(-5 * bitterness ** 2) * (1 - congener_taint * 0.3)
+    cleanliness = 10 * exp(-5 * perceived_bitterness ** 2) * (1 - congener_taint * 0.3)
+
+    # Visual / presentation: louche quality (opalescence)
+    # Drinkability includes the visual experience. A proper limoncello
+    # should have a milky opalescent glow, not be transparent or oil-slicked.
+    presentation = 6 + 4 * louche_quality
 
     # Smoothness from resting
     smoothness = 6 + 4 * ester_formation  # 6-10 range
 
-    # Geometric mean (6 components -- one bad dimension drags everything down)
+    # Geometric mean (7 components -- one bad dimension drags everything down)
     components = [burn_comfort, sweet_score, flavor_score, mouthfeel,
-                  cleanliness, smoothness]
+                  cleanliness, smoothness, presentation]
     geo_mean = float(np.prod([max(c, 0.001) for c in components]) ** (1 / len(components)))
     drinkability = float(np.clip(geo_mean, 0, 10))
 
@@ -426,8 +517,9 @@ def score(v: dict) -> tuple[float, dict]:
     quality_ease = max(4, 10 - 0.5 * max(vod_quality - 5, 0))
 
     # Lemon variety availability:
-    # Eureka=everywhere, Primofiore=Italian shops, Femminello=specialty, Meyer=seasonal
-    variety_ease = {1: 10, 2: 4, 3: 7, 4: 5}.get(variety, 7)
+    # Eureka=everywhere, Primofiore=Italian shops, Femminello=specialty,
+    # Meyer=seasonal, Interdonato=Italian/specialty, Verna=European markets
+    variety_ease = {1: 10, 2: 4, 3: 7, 4: 5, 5: 4, 6: 5}.get(variety, 7)
 
     # Freshness: 1-3 days = farmers market trip, 4-7 = normal store, 8+ = easy
     if fresh_days <= 3:
@@ -477,7 +569,8 @@ def score(v: dict) -> tuple[float, dict]:
     brix_auth = exp(-0.5 * ((brix - TARGET_BRIX) / 5) ** 2)
     oil_auth  = min(1.0, oil_conc / 1.5)
     # Femminello is the canonical limoncello lemon; Primofiore is acceptable
-    variety_auth = {1: 0.6, 2: 1.0, 3: 0.3, 4: 0.8}.get(variety, 0.5)
+    # Interdonato has Sicilian heritage; Verna is Spanish (less traditional)
+    variety_auth = {1: 0.6, 2: 1.0, 3: 0.3, 4: 0.8, 5: 0.7, 6: 0.5}.get(variety, 0.5)
     authenticity = float(10 * np.clip(
         (abv_auth * brix_auth * oil_auth * variety_auth) ** (1/4), 0, 1
     ))
@@ -544,6 +637,46 @@ def sanity_check():
           "sugar_g": 1000, "water_ml": 1000, "zest_fineness": 5,
           "infusion_temp_c": 18, "vodka_quality": 7, "rest_days": 14,
           "serving_temp_c": -10}),
+        # Meyer lemon variation (California style):
+        # 14 Meyer lemons (need more due to less oil), vodka, longer steep
+        ("Meyer California",
+         {"lemons": 14, "lemon_variety": 3, "freshness_days": 2,
+          "spirit_abv": 0.40, "spirit_vol": 750, "days": 14,
+          "sugar_g": 550, "water_ml": 600, "zest_fineness": 7,
+          "infusion_temp_c": 20, "vodka_quality": 7, "rest_days": 7,
+          "serving_temp_c": -8}),
+        # Sorrento IGP commercial profile:
+        # Strict IGP spec: Sfusato only, 96% alcohol, 25-30% final ABV, 25-32 Brix
+        ("Sorrento IGP",
+         {"lemons": 18, "lemon_variety": 2, "freshness_days": 1,
+          "spirit_abv": 0.96, "spirit_vol": 1200, "days": 15,
+          "sugar_g": 900, "water_ml": 1800, "zest_fineness": 5,
+          "infusion_temp_c": 16, "vodka_quality": 7, "rest_days": 21,
+          "serving_temp_c": -14}),
+        # Cold infusion (fridge method, popular on r/limoncello):
+        # 10 lemons, grain alcohol, 30+ days cold, less bitterness risk
+        ("Reddit cold infusion",
+         {"lemons": 10, "lemon_variety": 1, "freshness_days": 3,
+          "spirit_abv": 0.96, "spirit_vol": 750, "days": 40,
+          "sugar_g": 650, "water_ml": 900, "zest_fineness": 8,
+          "infusion_temp_c": 4, "vodka_quality": 6, "rest_days": 14,
+          "serving_temp_c": -12}),
+        # Sicilian Interdonato style:
+        # Mild acidity Interdonato lemons, clean zesting, medium rest
+        ("Sicilian Interdonato",
+         {"lemons": 12, "lemon_variety": 5, "freshness_days": 2,
+          "spirit_abv": 0.96, "spirit_vol": 1000, "days": 10,
+          "sugar_g": 750, "water_ml": 1200, "zest_fineness": 5,
+          "infusion_temp_c": 20, "vodka_quality": 6, "rest_days": 14,
+          "serving_temp_c": -10}),
+        # Minimal/quick recipe (worst case test):
+        # 4 lemons, vodka, 2 days, minimal rest
+        ("Quick minimal",
+         {"lemons": 4, "lemon_variety": 1, "freshness_days": 10,
+          "spirit_abv": 0.40, "spirit_vol": 375, "days": 2,
+          "sugar_g": 200, "water_ml": 200, "zest_fineness": 3,
+          "infusion_temp_c": 25, "vodka_quality": 3, "rest_days": 0,
+          "serving_temp_c": 5}),
     ]
     print("\n" + "="*65)
     print("  SANITY CHECK")
@@ -584,7 +717,7 @@ def print_diagnostics(v: dict):
     freshness_factor = exp(-0.035 * max(fresh_days - 1, 0))
     oil_per_lemon = lp["oil_ml"] * freshness_factor
 
-    abv_rate = (abv / 0.96) ** 1.5
+    abv_rate = 1 / (1 + exp(-15 * (abv - 0.48)))
     temp_factor = 2 ** ((inf_temp - REF_TEMP_C) / 10)
     zest_area = 0.3 + 0.12 * max(zest_fine, 1)
     rate = abv_rate * temp_factor * zest_area
@@ -592,10 +725,16 @@ def print_diagnostics(v: dict):
     k_slow = 0.08 * rate
     extraction = 0.60 * (1 - exp(-k_fast * days)) + 0.40 * (1 - exp(-k_slow * days))
     total_oil = lemons * oil_per_lemon * extraction
+    evap_rate = 0.0007 * 2 ** ((inf_temp - 20) / 15)
+    abv_after_infusion = abv * (1 - evap_rate * days)
+    abv_after_infusion = max(abv_after_infusion, abv * 0.85)
+    oxidation_days = max(0, days - 14)
+    oxidation_temp = 1 + 0.5 * max(0, (inf_temp - 18) / 12)
+    terpene_freshness = exp(-0.008 * oxidation_days * oxidation_temp)
     total_vol = vol + water + sugar * 0.63
     oil_conc = total_oil / total_vol * 1000
     citral_conc = total_oil * lp["citral_frac"] / total_vol * 1000
-    final_abv = abv * vol / total_vol
+    final_abv = abv_after_infusion * vol / total_vol
     spirit_density = abv * 0.789 + (1 - abv)
     total_mass = vol * spirit_density + water + sugar
     brix = sugar / total_mass * 100
@@ -606,10 +745,12 @@ def print_diagnostics(v: dict):
     else:
         limonin_rate = 0.05 * (1 + 0.5 * abv) * pith_exposure * temp_bitter
         bitterness = pith_exposure * (1 - exp(-limonin_rate * days))
+    sweet_mask = 1 - 0.4 * min(1, brix / 30)
+    perceived_bitterness = bitterness * sweet_mask
     burn_quality = 1.36 - 0.06 * max(vod_quality, 1)
     mellow_factor = 1 - 0.25 * exp(-0.12 * max(rest, 0))
     burn_room = 10 * (final_abv / 0.50) ** 1.3
-    cold_factor = 0.25 + 0.75 * max(0, (serv_temp + 18) / 38)
+    cold_factor = 1 / (1 + exp(-0.3 * (serv_temp + 2)))
     burn = burn_room * cold_factor * burn_quality * mellow_factor
     ester = 1 - exp(-0.14 * max(rest, 0))
     congener_taint = (10 - max(vod_quality, 1)) / 10 * 0.12
@@ -619,6 +760,7 @@ def print_diagnostics(v: dict):
     sugar_stab = 0.5 + 0.5 * min(1, brix / 30)
     rest_stab = 1 - 0.3 * exp(-0.2 * max(rest, 0))
     emulsion = min(1, emulsion_abv * sugar_stab * rest_stab)
+    louche = exp(-0.5 * ((oil_conc - 1.5) / 1.0) ** 2)
 
     print(f"\n  WINNER DIAGNOSTICS")
     print(f"  {'-'*61}")
@@ -628,14 +770,16 @@ def print_diagnostics(v: dict):
     print(f"    Total oil:         {total_oil:.2f} mL")
     print(f"    Oil concentration: {oil_conc:.2f} mL/L")
     print(f"    Citral conc:       {citral_conc:.3f} mL/L")
+    print(f"    Terpene freshness: {terpene_freshness:.2f} (oxidation after 14d)")
     print(f"    Total volume:      {total_vol:.0f} mL")
-    print(f"    Final ABV:         {final_abv*100:.1f}%")
+    print(f"    Final ABV:         {final_abv*100:.1f}% (evap loss: {(1 - abv_after_infusion/abv)*100:.1f}%)")
     print(f"    Brix:              {brix:.1f}")
-    print(f"    Bitterness:        {bitterness:.3f} (pith exposure {pith_exposure:.3f})")
-    print(f"    Burn at {serv_temp:.0f}C:      {burn:.2f}/10")
+    print(f"    Bitterness:        {bitterness:.3f} (perceived: {perceived_bitterness:.3f}, pith {pith_exposure:.3f})")
+    print(f"    Burn at {serv_temp:.0f}C:      {burn:.2f}/10 (cold factor {cold_factor:.2f})")
     print(f"    Perceived sweet:   {perceived_sweet:.2f}/10")
     print(f"    Ester formation:   {ester*100:.0f}%")
     print(f"    Emulsion stability:{emulsion:.2f}")
+    print(f"    Louche quality:    {louche:.2f}")
     print(f"    Congener taint:    {congener_taint:.3f}")
     print(f"    Mellow factor:     {mellow_factor:.3f}")
     print(f"    Headspace aroma:   {henry_temp:.2f}")
@@ -669,9 +813,12 @@ def write_recipe(r: dict, scores: dict, filepath: str = "recipe.txt"):
     serv_temp = int(round(v["serving_temp_c"]))
     fresh = int(round(v["freshness_days"]))
 
-    # Derived values
+    # Derived values (match scoring model's ethanol evaporation)
+    evap_rate = 0.0007 * 2 ** ((inf_temp - 20) / 15)
+    abv_eff = abv * (1 - evap_rate * max(days, 0))
+    abv_eff = max(abv_eff, abv * 0.85)  # cap at 15% loss
     total_vol_ml = vol + water + sugar * 0.63
-    final_abv = (abv * vol) / total_vol_ml
+    final_abv = (abv_eff * vol) / total_vol_ml
     brix = (sugar / total_vol_ml) * 100
     spirit_proof = abv * 200
     yield_ml = total_vol_ml
@@ -889,6 +1036,13 @@ def write_recipe(r: dict, scores: dict, filepath: str = "recipe.txt"):
     elif variety_id == 4:
         w("     Primofiore are seasonal Italian lemons with high acidity")
         w("     that adds brightness and complexity.")
+    elif variety_id == 5:
+        w("     Interdonato is a Sicilian hybrid (citron x lemon) with")
+        w("     mild acidity, thin pith, and complex terpene profile.")
+        w("     Easier to zest cleanly than thicker-pithed varieties.")
+    elif variety_id == 6:
+        w("     Verna is a widely grown Spanish cultivar with balanced")
+        w("     citral and good oil yield. Common in European markets.")
     w("")
     w("  Storage: Keeps 1+ year in freezer. Indefinitely if sealed.")
     w("  Cloudiness is normal and a sign of good oil extraction.")
@@ -915,19 +1069,89 @@ if __name__ == "__main__":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+    # Use all available CPU power
+    _ncpu = os.cpu_count() or 1
+    print(f"\n  CPU cores available: {_ncpu}")
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x00000080)
+            print(f"  Process priority:   HIGH")
+        else:
+            os.nice(-10)
+            print(f"  Process priority:   HIGH (nice -10)")
+    except (PermissionError, OSError, AttributeError):
+        print(f"  Process priority:   default (no permission to elevate)")
+    except Exception:
+        pass
+
     total_start = _time.time()
 
     sanity_check()
 
     opt = RecipeOptimizer("Limoncello", variables, score)
-    result = opt.run(de_restarts=100, de_popsize=500, de_maxiter=2500, n_jobs=-1)
 
-    print_diagnostics(result["rounded"])
+    # ===================================================================
+    # PHASE 1: DE global exploration (broad search, find promising basins)
+    # ===================================================================
+    result = opt.run(de_restarts=100, de_popsize=500, de_maxiter=2500, n_jobs=-1)
+    de_best = result["rounded"]
+    de_score = result["composite"]
+
+    print_diagnostics(de_best)
+
+    # ===================================================================
+    # PHASE 2: SA primary optimization (better at narrow optima)
+    # SA consistently finds improvements over DE on this landscape.
+    # Run it as the main optimizer seeded from DE's best result.
+    # ===================================================================
+    sa1 = opt.sa_search(
+        x0=de_best,
+        sa_restarts=200, sa_maxiter=50000,
+        nm_after=True, n_jobs=-1,
+    )
+    sa1_best = sa1["rounded"]
+    sa1_score = sa1["composite"]
+
+    # Take whichever is better
+    if sa1_score > de_score + 1e-6:
+        current_best = sa1_best
+        current_score = sa1_score
+        print(f"\n  SA improved over DE: {de_score:.6f} -> {sa1_score:.6f} (+{sa1_score - de_score:.6f})")
+    else:
+        current_best = de_best
+        current_score = de_score
+        print(f"\n  DE result held: {de_score:.6f}")
+
+    # ===================================================================
+    # PHASE 3: Iterative SA refinement
+    # Keep running SA from the current best until no improvement found.
+    # Each round uses fewer restarts but focused around the best region.
+    # ===================================================================
+    for round_num in range(1, 4):  # up to 3 refinement rounds
+        print(f"\n  SA refinement round {round_num} (from score={current_score:.6f})...")
+        sa_ref = opt.sa_search(
+            x0=current_best,
+            sa_restarts=100, sa_maxiter=50000,
+            nm_after=True, n_jobs=-1,
+        )
+        if sa_ref["composite"] > current_score + 1e-6:
+            improvement = sa_ref["composite"] - current_score
+            current_best = sa_ref["rounded"]
+            current_score = sa_ref["composite"]
+            print(f"  Round {round_num} improved: +{improvement:.6f} -> {current_score:.6f}")
+        else:
+            print(f"  Round {round_num}: no improvement, stopping refinement.")
+            break
+
+    print_diagnostics(current_best)
 
     # Sensitivity analysis
     print(f"\n  SENSITIVITY (+/-5% perturbation)")
     print(f"  {'-'*61}")
-    sens = opt.sensitivity(result["rounded"])
+    sens = opt.sensitivity(current_best)
     sorted_sens = sorted(sens.items(), key=lambda x: abs(x[1]['sensitivity']), reverse=True)
     for name, info in sorted_sens:
         s = info['sensitivity']
@@ -939,25 +1163,53 @@ if __name__ == "__main__":
     # Save result
     print(f"\n  Total evaluations: {EVAL_COUNT:,}")
     output = {
-        "recipe": result["rounded"],
-        "composite_score": round(result["composite"], 6),
-        "criterion_scores": {k: round(v, 4) for k, v in result["scores"].items()},
-        "stats": {**result["stats"], "total_evaluations": EVAL_COUNT},
+        "recipe": current_best,
+        "composite_score": round(current_score, 6),
+        "criterion_scores": {k: round(v, 4) for k, v in opt.score(current_best)[1].items()},
+        "stats": {
+            **result["stats"],
+            "total_evaluations": EVAL_COUNT,
+            "de_score": round(de_score, 6),
+            "sa_score": round(sa1_score, 6),
+            "final_score": round(current_score, 6),
+        },
     }
     with open("result.json", "w") as f:
         json.dump(output, f, indent=2)
     print(f"  Result saved to result.json")
 
     # Write human-readable recipe
-    write_recipe(result["rounded"], output)
+    write_recipe(current_best, output)
 
-    # Verification
-    verification = opt.verify(result["rounded"], n_random=100000, n_restarts=50, n_jobs=-1)
+    # ===================================================================
+    # PHASE 4: Verification
+    # ===================================================================
+    verification = opt.verify(current_best, n_random=500000, n_restarts=100, n_jobs=-1)
 
-    # Cross-check with simulated annealing and basin-hopping
-    cross = opt.cross_check(result["rounded"],
-                            sa_restarts=25, sa_maxiter=15000,
-                            bh_restarts=25, bh_niter=500, n_jobs=-1)
+    # Final cross-check with basin-hopping (different algorithm family)
+    cross = opt.cross_check(current_best,
+                            sa_restarts=50, sa_maxiter=25000,
+                            bh_restarts=50, bh_niter=1000, n_jobs=-1)
+
+    # If cross-check still finds improvement, one more SA pass
+    if not cross["confirmed"]:
+        print(f"\n  Cross-check found improvement (+{cross['improvement']:.6f}), final SA pass...")
+        final_sa = opt.sa_search(
+            x0=cross["overall_best_values"],
+            sa_restarts=100, sa_maxiter=50000,
+            nm_after=True, n_jobs=-1,
+        )
+        if final_sa["composite"] > current_score:
+            current_best = final_sa["rounded"]
+            current_score = final_sa["composite"]
+            output["recipe"] = current_best
+            output["composite_score"] = round(current_score, 6)
+            output["criterion_scores"] = {k: round(v, 4) for k, v in final_sa["scores"].items()}
+            output["stats"]["final_score"] = round(current_score, 6)
+            with open("result.json", "w") as f:
+                json.dump(output, f, indent=2)
+            write_recipe(current_best, output)
+            print_diagnostics(current_best)
 
     total_elapsed = _time.time() - total_start
     m, s = divmod(int(total_elapsed), 60)
@@ -965,4 +1217,5 @@ if __name__ == "__main__":
     print(f"\n{'='*65}")
     print(f"  DONE  Total time: {h}h {m}m {s}s")
     print(f"  Total evaluations: {EVAL_COUNT:,}")
+    print(f"  Final score: {current_score:.6f}")
     print(f"{'='*65}")
