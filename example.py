@@ -1096,7 +1096,7 @@ if __name__ == "__main__":
     # ===================================================================
     # PHASE 1: DE global exploration (broad search, find promising basins)
     # ===================================================================
-    result = opt.run(de_restarts=100, de_popsize=500, de_maxiter=2500, n_jobs=-1)
+    result = opt.run(de_restarts=250, de_popsize=750, de_maxiter=5000, n_jobs=-1)
     de_best = result["rounded"]
     de_score = result["composite"]
 
@@ -1109,7 +1109,7 @@ if __name__ == "__main__":
     # ===================================================================
     sa1 = opt.sa_search(
         x0=de_best,
-        sa_restarts=200, sa_maxiter=50000,
+        sa_restarts=400, sa_maxiter=100000,
         nm_after=True, n_jobs=-1,
     )
     sa1_best = sa1["rounded"]
@@ -1130,11 +1130,11 @@ if __name__ == "__main__":
     # Keep running SA from the current best until no improvement found.
     # Each round uses fewer restarts but focused around the best region.
     # ===================================================================
-    for round_num in range(1, 4):  # up to 3 refinement rounds
+    for round_num in range(1, 6):  # up to 5 refinement rounds
         print(f"\n  SA refinement round {round_num} (from score={current_score:.6f})...")
         sa_ref = opt.sa_search(
             x0=current_best,
-            sa_restarts=100, sa_maxiter=50000,
+            sa_restarts=200, sa_maxiter=100000,
             nm_after=True, n_jobs=-1,
         )
         if sa_ref["composite"] > current_score + 1e-6:
@@ -1184,19 +1184,19 @@ if __name__ == "__main__":
     # ===================================================================
     # PHASE 4: Verification
     # ===================================================================
-    verification = opt.verify(current_best, n_random=500000, n_restarts=100, n_jobs=-1)
+    verification = opt.verify(current_best, n_random=1000000, n_restarts=200, n_jobs=-1)
 
     # Final cross-check with basin-hopping (different algorithm family)
     cross = opt.cross_check(current_best,
-                            sa_restarts=50, sa_maxiter=25000,
-                            bh_restarts=50, bh_niter=1000, n_jobs=-1)
+                            sa_restarts=100, sa_maxiter=50000,
+                            bh_restarts=100, bh_niter=2000, n_jobs=-1)
 
     # If cross-check still finds improvement, one more SA pass
     if not cross["confirmed"]:
         print(f"\n  Cross-check found improvement (+{cross['improvement']:.6f}), final SA pass...")
         final_sa = opt.sa_search(
             x0=cross["overall_best_values"],
-            sa_restarts=100, sa_maxiter=50000,
+            sa_restarts=200, sa_maxiter=100000,
             nm_after=True, n_jobs=-1,
         )
         if final_sa["composite"] > current_score:
