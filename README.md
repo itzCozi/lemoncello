@@ -1,4 +1,4 @@
-# Lemoncello
+# limoncello
 
 A general-purpose framework for finding the globally optimal recipe for any food or drink. Define your variables, write a scoring function that encodes your sensory science, and let the optimizer find the best recipe.
 

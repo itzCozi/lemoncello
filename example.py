@@ -49,9 +49,9 @@ from framework import RecipeOptimizer, Variable
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TARGET_ABV = 0.28           # traditional limoncello
-TARGET_SWEET = 5.2          # perceived sweetness target (0-10 scale)
-TARGET_BRIX = 27            # traditional range 25-30
+TARGET_ABV = 0.27           # traditional limoncello (26-27% range)
+TARGET_SWEET = 4.8          # perceived sweetness target (0-10 scale, less heavy)
+TARGET_BRIX = 25            # lighter body, less syrupy
 REF_TEMP_C = 20             # reference temperature for Arrhenius (room temp)
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ variables = [
     Variable("spirit_abv", 0.40, 0.96, unit="fraction"),
     Variable("spirit_vol", 300, 1500, unit="mL", rounding=5),
     Variable("days", 2, 45, unit="days", rounding=1),
-    Variable("sugar_g", 200, 1500, unit="g", rounding=5),
+    Variable("sugar_g", 800, 950, unit="g", rounding=5),
     Variable("water_ml", 200, 2500, unit="mL", rounding=5),
     # Technique & process
     Variable("zest_fineness", 1, 10, unit="1=peeler,10=microplane", rounding=1),
@@ -1096,7 +1096,7 @@ if __name__ == "__main__":
     # ===================================================================
     # PHASE 1: DE global exploration (broad search, find promising basins)
     # ===================================================================
-    result = opt.run(de_restarts=250, de_popsize=750, de_maxiter=5000, n_jobs=-1)
+    result = opt.run(de_restarts=20, de_popsize=200, de_maxiter=2000, n_jobs=-1)
     de_best = result["rounded"]
     de_score = result["composite"]
 
@@ -1109,7 +1109,7 @@ if __name__ == "__main__":
     # ===================================================================
     sa1 = opt.sa_search(
         x0=de_best,
-        sa_restarts=400, sa_maxiter=100000,
+        sa_restarts=50, sa_maxiter=20000,
         nm_after=True, n_jobs=-1,
     )
     sa1_best = sa1["rounded"]
@@ -1130,11 +1130,11 @@ if __name__ == "__main__":
     # Keep running SA from the current best until no improvement found.
     # Each round uses fewer restarts but focused around the best region.
     # ===================================================================
-    for round_num in range(1, 6):  # up to 5 refinement rounds
+    for round_num in range(1, 3):  # up to 2 refinement rounds
         print(f"\n  SA refinement round {round_num} (from score={current_score:.6f})...")
         sa_ref = opt.sa_search(
             x0=current_best,
-            sa_restarts=200, sa_maxiter=100000,
+            sa_restarts=30, sa_maxiter=20000,
             nm_after=True, n_jobs=-1,
         )
         if sa_ref["composite"] > current_score + 1e-6:
@@ -1184,19 +1184,19 @@ if __name__ == "__main__":
     # ===================================================================
     # PHASE 4: Verification
     # ===================================================================
-    verification = opt.verify(current_best, n_random=1000000, n_restarts=200, n_jobs=-1)
+    verification = opt.verify(current_best, n_random=100000, n_restarts=30, n_jobs=-1)
 
     # Final cross-check with basin-hopping (different algorithm family)
     cross = opt.cross_check(current_best,
-                            sa_restarts=100, sa_maxiter=50000,
-                            bh_restarts=100, bh_niter=2000, n_jobs=-1)
+                            sa_restarts=20, sa_maxiter=10000,
+                            bh_restarts=20, bh_niter=500, n_jobs=-1)
 
     # If cross-check still finds improvement, one more SA pass
     if not cross["confirmed"]:
         print(f"\n  Cross-check found improvement (+{cross['improvement']:.6f}), final SA pass...")
         final_sa = opt.sa_search(
             x0=cross["overall_best_values"],
-            sa_restarts=200, sa_maxiter=100000,
+            sa_restarts=30, sa_maxiter=20000,
             nm_after=True, n_jobs=-1,
         )
         if final_sa["composite"] > current_score:
